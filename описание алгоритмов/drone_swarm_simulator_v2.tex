@@ -1,0 +1,251 @@
+% Technical description: Drone_Swarm_Simulator_v2 (Russian body text).
+% Build: pdflatex drone_swarm_simulator_v2.tex
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+
+\title{\texttt{Drone\_Swarm\_Simulator\_v2}:\\
+техническое описание симулятора роя и цикла эксперимента}
+\author{По исходному коду репозитория \texttt{Kursov3/Drone\_Swarm\_Simulator\_v2} и SITL ArduPilot}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Документ описывает назначение, архитектуру и основные алгоритмы проекта \texttt{Drone\_Swarm\_Simulator\_v2}: единый процесс Python, подключающийся по MAVLink к нескольким экземплярам ArduPilot SITL (и опционально к Webots), обмен координатами внутри процесса, регуляторы PID и сценарии \texttt{leader\_forward\_back}, \texttt{linear\_chain2}. Явно подчёркивается, что жёсткотельная динамика и интегрирование движения выполняются в SITL/Webots, а не в коде Python данного репозитория. При первом появлении поясняются обозначения в формулах.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%---------------------------------------------------------------------
+\section{Назначение проекта и структура каталогов}
+
+\paragraph{Назначение.}
+Проект предназначен для исследования алгоритмов координации роя однотипных мультикоптеров в связке \emph{ArduPilot SITL} + \emph{MAVLink} + \emph{Python}. Управляющий код на Python задаёт высокоуровневые команды (режимы полёта, \texttt{RC\_OVERRIDE}, запросы потоков телеметрии), считывает локальные координаты и ориентацию с каждого борта, распространяет информацию о положениях между логическими «агентами» в одном адресном пространстве процесса и записывает результаты в CSV; предусмотрено воспроизведение в ROS/RViz и опциональная 2D-визуализация.
+
+\paragraph{Структура (по \texttt{README.md}).}
+\begin{itemize}
+  \item \texttt{launch\_simulation.py} --- единая точка входа для одиночного запуска (SITL и/или Webots, сценарий, опции визуализатора).
+  \item \texttt{run\_batch.py} --- пакетный запуск серии экспериментов.
+  \item \texttt{config/} --- файлы параметров ArduPilot (в т.\,ч.\ \texttt{iris.parm}).
+  \item \texttt{core/} --- ядро: MAVLink-обёртка, мониторы координат и скорости, PID, логирование.
+  \item \texttt{scenarios/} --- сценарии экспериментов (\texttt{leader\_forward\_back.py}, \texttt{linear\_chain2.py} и др.).
+  \item \texttt{replay/} --- воспроизведение логов в ROS/RViz.
+  \item \texttt{visualizer/} --- 2D-визуализация (matplotlib), приём позиций по UDP.
+  \item \texttt{experiments/}, \texttt{docs/} --- результаты и локальная документация (не обязательны для работы кода).
+\end{itemize}
+
+%---------------------------------------------------------------------
+\section{Обмен данными: частоты и механизмы}
+
+Все величины времени ниже --- в секундах (с), частоты --- в герцах (Гц), если не указано иное.
+
+\paragraph{Аргумент лаунчера \texttt{--exchange-hz}.}
+В \texttt{launch\_simulation.py} параметр командной строки \texttt{--exchange-hz} имеет значение по умолчанию $f_{\mathrm{exch}} = 50$~Гц и передаётся запускаемому сценарию как \texttt{--exchange-hz}, задавая номинальную частоту цикла обмена координатами между контроллерами дронов в одном процессе Python.
+
+\paragraph{Потоки MAVLink: запрос интервала сообщений.}
+Класс \texttt{MAVLinkWorker} (\texttt{core/mavlink/worker.py}) по командам инициализации отправляет \texttt{MAV\_CMD\_SET\_MESSAGE\_INTERVAL} для сообщений \texttt{LOCAL\_POSITION\_NED} и \texttt{ATTITUDE}. Интервал между экземплярами одного сообщения задаётся как
+\begin{equation}
+  T_{\mathrm{msg}} = \frac{10^6}{f_{\mathrm{stream}}} \;\mu\text{с},
+\end{equation}
+то есть в коде \texttt{interval\_us = int(1e6 / hz)} при заданной частоте потока $f_{\mathrm{stream}}$ (по умолчанию в шагах инициализации сценариев $f_{\mathrm{stream}} = 50$~Гц). Таким образом, телеметрия положения и угловой ориентации с борта запрашивается с частотой 50~Гц.
+
+\paragraph{Цикл приёма в рабочем потоке MAVLink.}
+В методе \texttt{\_run\_loop} вызывается \texttt{recv\_match(\ldots, blocking=False, timeout=0.01)}, т.\,е.\ тайм-аут опроса входящих сообщений $\tau_{\mathrm{recv}} = 0{,}01$~с. После попытки чтения выполняется \texttt{time.sleep(0.01)} --- пауза $\tau_{\mathrm{sleep}} = 0{,}01$~с между итерациями цикла потока. Итоговая частота опроса не жёстко равна 100~Гц из-за обработки очереди команд, но порядок величины --- около десятков герц опроса сокета при номинальной доставке сообщений 50~Гц с автопилота.
+
+\paragraph{Поддержание канала RC (\texttt{RC\_OVERRIDE}).}
+В \texttt{DroneController.start\_rc\_keepalive} (\texttt{core/control/drone\_controller.py}) фоновый поток с периодом $T_{\mathrm{rc}} = 0{,}2$~с повторно отправляет последние заданные значения каналов \texttt{RC\_OVERRIDE} через \texttt{MAVLinkWorker}, чтобы канал управления не считался устаревшим со стороны автопилота.
+
+\paragraph{Визуализатор: UDP JSON.}
+Модуль \texttt{visualizer/position\_publisher.py} отправляет словарь позиций (и опционально словарь частот) на узел \texttt{127.0.0.1}, порт \texttt{15551} по протоколу UDP; полезная нагрузка --- строка JSON (\texttt{json.dumps}, кодировка UTF-8). Сценарии вызывают \texttt{publish\_positions} из цикла обмена координатами при наличии импорта.
+
+%---------------------------------------------------------------------
+\section{Жизненный цикл эксперимента}
+
+Ниже --- типичная последовательность при запуске \texttt{python launch\_simulation.py \ldots}.
+
+\begin{enumerate}
+  \item \textbf{Старт внешних процессов.} При режиме Webots сначала запускается симулятор Webots с сформированным миром; затем для каждого дрона --- \texttt{sim\_vehicle.py} (ArduCopter, SITL). В режиме только SITL запускаются $N$ процессов \texttt{sim\_vehicle.py} без Webots.
+  \item \textbf{Ожидание готовности MAVLink.} После старта SITL лаунчер вызывает \texttt{wait\_all\_sitl\_heartbeats}: на каждом UDP-порту ожидается сообщение \texttt{HEARTBEAT} с ожидаемым системным идентификатором (тайм-аут по умолчанию 120~с на каждый борт).
+  \item \textbf{Пауза стабилизации (\emph{settle}).} Вычисляется \texttt{settle\_sec = min(8.0, 2.0 + 0.25 * max(0, num\_drones - 4))}; процесс засыпает на эту длительность перед запуском сценария.
+  \item \textbf{Старт сценария.} Подпроцесс Python запускает выбранный скрипт из \texttt{scenarios/} с аргументами \texttt{--drones}, при необходимости \texttt{--duration}, \texttt{--experiment-dir}, \texttt{--run-id}, \texttt{--exchange-hz}.
+  \item \textbf{Инициализация в сценарии.} Для каждого дрона создаётся \texttt{DroneController}, вызывается \texttt{connect} (создание \texttt{MAVLinkWorker}, ожидание первого heartbeat внутри \texttt{start}), затем \texttt{initialize(init\_steps)}: последовательность команд в очереди рабочего потока (режим, арминг, взлёт, переход в удержание позиции, нейтральный RC, запрос потоков \texttt{LOCAL\_POSITION\_NED}/\texttt{ATTITUDE} на 50~Гц и т.\,д.). Запускается \texttt{start\_rc\_keepalive}.
+  \item \textbf{Цикл обмена координатами.} Параллельно или в главном потоке сценария выполняется \texttt{coordinate\_exchange\_loop}: сбор позиций, перевод в общую NED-систему (см.\ раздел~\ref{sec:topology}), рассылка в \texttt{other\_drones\_positions}, опционально публикация в визуализатор.
+  \item \textbf{Циклы управления.} Потоки или циклы сценария (\texttt{follower\_loop}, \texttt{internal\_chain\_anatoliy\_loop}, \texttt{endpoint\_loop} и т.\,п.) используют кэшированные позиции соседей и формируют \texttt{RC\_OVERRIDE}.
+  \item \textbf{Логирование и завершение.} Запись CSV/метаданных (в зависимости от сценария), по завершении сценария или сигналу SIGINT/SIGTERM лаунчер завершает дочерние процессы (SITL, визуализатор, Webots).
+\end{enumerate}
+
+Воспроизведение записанных траекторий выполняется отдельными скриптами в \texttt{replay/} и не является частью описанного цикла \texttt{launch\_simulation.py}, но использует те же логические данные (CSV, метаданные).
+
+%---------------------------------------------------------------------
+\section{Связи, топология и общая система координат}
+\label{sec:topology}
+
+\paragraph{Один процесс --- $N$ экземпляров SITL.}
+Управляющее приложение Python не открывает MAVLink-соединений «дрон--дрон». Для дрона с индексом экземпляра $i \in \{0,\ldots,N-1\}$ в \texttt{launch\_simulation.py} задаётся вывод \texttt{sim\_vehicle.py} на UDP \texttt{127.0.0.1:(14551 + 10 i)}. Системный идентификатор MAVLink (\texttt{sysid}) назначается равным $i+1$. Таким образом, топология обмена с носителями --- \emph{звезда}: центральный процесс Python и $N$ независимых UDP-каналов к автопилотам.
+
+\paragraph{Общий кадр NED и смещение по востоку.}
+Каждый SITL получает свою «домашнюю» точку: базовые широта/долгота фиксированы, долгота сдвигается так, чтобы в общей локальной системе NED (ось $x$ --- север, $y$ --- восток, $z$ --- вниз) соседние экземпляры были разнесены по востоку на $2$~м: для идентификатора дрона в конфигурации $d_{\mathrm{id}}$ (совпадает с \texttt{sysid}) поправка к координате $y$ при переходе к общему кадру есть $(d_{\mathrm{id}}-1)\cdot 2$~м (см.\ функции вроде \texttt{\_my\_position\_common} в \texttt{linear\_chain2.py} и аналогичную логику в \texttt{leader\_forward\_back.py}).
+
+\paragraph{Обмен между дронами внутри процесса.}
+Словарь \texttt{other\_drones\_positions} в \texttt{DroneController} обновляется из \texttt{coordinate\_exchange\_loop}: каждый контроллер записывает позиции остальных, уже приведённые к общему NED. Прямой рассылки MAVLink между бортами нет.
+
+\paragraph{Топологии сценариев.}
+\begin{itemize}
+  \item \textbf{Звезда (лидер --- последователи).} В \texttt{leader\_forward\_back} последователи используют позицию лидера из \texttt{get\_other\_drones\_positions}; граф информационных зависимостей --- «лидер $\to$ каждый последователь».
+  \item \textbf{Цепь.} В \texttt{linear\_chain2} выделяются концевые «якоря» и внутренние звенья; внутренний закон опирается на множество соседей в радиусе видимости вдоль и поперёк отрезка между опорными точками, т.\,е.\ информационно релевантна геометрия цепи (соседи по проекции на отрезок), а не полный граф роя.
+\end{itemize}
+
+%---------------------------------------------------------------------
+\section{Регуляторы и законы управления в проекте}
+
+\subsection{Класс \texttt{PIDRegulator} (\texttt{core/control/pid.py})}
+
+Обозначения: $e(t)$ --- входная ошибка регулирования; $\Delta t$ --- шаг времени между вызовами (если не передан явно, оценивается по часам); $K_p$, $K_i$, $K_d$ --- коэффициенты пропорциональной, интегральной и дифференциальной составляющих; $I_{\mathrm{lim}}$ --- предел модуля интеграла (\texttt{integral\_limit}, антиперегрузка интегратора при $I_{\mathrm{lim}}>0$); $U_{\mathrm{lim}}$ --- симметричное ограничение выхода (\texttt{output\_limit}); $\alpha_d \in [0,1]$ --- параметр сглаживания производной (\texttt{derivative\_alpha}), при $\alpha_d>0$ используется рекуррентное низкочастотное фильтрование разностной оценки производной ошибки.
+
+Алгоритм одного шага:
+\begin{align}
+  I &\leftarrow I + e\,\Delta t, \qquad
+  I \leftarrow \mathrm{sat}(I; -I_{\mathrm{lim}}, I_{\mathrm{lim}}) \quad \text{при } I_{\mathrm{lim}}>0, \\
+  D_{\mathrm{raw}} &= \frac{e - e_{\mathrm{prev}}}{\Delta t} \quad (\text{при }\Delta t>0), \\
+  D &\leftarrow \alpha_d D + (1-\alpha_d) D_{\mathrm{raw}} \quad (\text{при }\alpha_d>0), \\
+  u &= K_p e + K_i I + K_d D, \qquad
+  u \leftarrow \mathrm{sat}(u; -U_{\mathrm{lim}}, U_{\mathrm{lim}}), \\
+  e_{\mathrm{prev}} &\leftarrow e.
+\end{align}
+Здесь $\mathrm{sat}(x; a, b)$ --- отсечение $x$ интервалом $[a,b]$. Выход $u$ далее масштабируется сценарием в PWM.
+
+\subsection{Сценарий \texttt{leader\_forward\_back}: последователь и ошибки}
+
+Пусть $p^L = (x^L, y^L, z^L)^\top$ --- позиция лидера в общем NED, $p^F = (x^F, y^F, z^F)^\top$ --- позиция последователя в том же кадре (с учётом смещения по $y$ на $(d_{\mathrm{id}}-1)\cdot 2$~м из сырой телеметрии). Задаются ошибки
+\begin{equation}
+  e_x = x^L - x^F, \qquad
+  e_y = (y^L - y^F) - d^\star,
+\end{equation}
+где $d^\star = 2$~м --- номинальный шаг формации вдоль оси востока (\texttt{FORMATION\_D\_STAR\_M}, совпадает с поправкой ``$-2$'' в коде для выравнивания по ряду). По оси ``вперёд/назад'' (pitch-канал RC) используется выход PID от $e_x$, по поперечной оси (roll) --- от $e_y$. Нейтральное значение PWM для стиков $u_{\mathrm{neut}} = 1500$ (\texttt{RC\_NEUTRAL}). Закон отправки (упрощённо):
+\begin{equation}
+  u_{\mathrm{pitch}} = u_{\mathrm{neut}} - \mathrm{PID}_p(e_x), \qquad
+  u_{\mathrm{roll}} = u_{\mathrm{neut}} + \mathrm{PID}_r(e_y),
+\end{equation}
+где $\mathrm{PID}_p$, $\mathrm{PID}_r$ --- два экземпляра \texttt{PIDRegulator} с одинаковыми настраиваемыми $K_p,K_i,K_d$.
+
+\subsection{Сценарий \texttt{linear\_chain2}: концевые точки, NED$\to$корпус, закон Anatoliy}
+
+\paragraph{Концевые дроны.}
+Для подлёта к целевой точке $p^\ast$ в общем NED используются два регулятора \texttt{PIDRegulator} (\texttt{pitch\_pid} с $K_p = \texttt{ENDPOINT\_X\_KP}$, \texttt{roll\_pid} с $K_p = \texttt{ENDPOINT\_Y\_KP}$) и ошибки
+\begin{equation}
+  e_x = x^\ast - x, \qquad e_y = y^\ast - y
+\end{equation}
+после опционального обнуления малых отклонений (\texttt{ERROR\_DEADBAND\_M}). Вектор $(e_x, e_y)^\top$ поворачивается из NED в горизонтальный базис корпуса ``вперёд--вправо'' с помощью угла рыскания $\psi$ из \texttt{ATTITUDE} (с множителем \texttt{YAW\_SIGN}):
+\begin{equation}
+  e_{\mathrm{fwd}} = e_x \cos\psi + e_y \sin\psi, \qquad
+  e_{\mathrm{right}} = -e_x \sin\psi + e_y \cos\psi.
+\end{equation}
+Далее $u_{\mathrm{pitch}} \propto \mathrm{PID}(e_{\mathrm{fwd}})$, $u_{\mathrm{roll}} \propto \mathrm{PID}(e_{\mathrm{right}})$ с тем же смыслом нейтрали $u_{\mathrm{neut}}$ и ограничениями \texttt{ENDPOINT\_OUTPUT\_LIMIT}.
+
+\paragraph{Внутренние дроны: расстояния и функции $g$, $\xi$, $\sigma$.}
+Пусть $u_{\mathrm{seg}} = (u_x, u_y)^\top$ --- единичный вектор вдоль отрезка между левым и правым якорем в плоскости $Oxy$ NED, $n_{\mathrm{seg}} = (-u_y, u_x)^\top$ --- перпендикуляр ``влево''. Для каждого соседа $j$ с относительным вектором $r_j = p_j - p$ в плоскости $Oxy$ вводятся координаты в базисе отрезка: $a_j = r_j \cdot u_{\mathrm{seg}}$, $c_j = r_j \cdot n_{\mathrm{seg}}$. По спискам $\{a_j\}$, $\{c_j\}$ для четырёх квадрантов вычисляются минимальные положительные расстояния $d_a^+$, $d_c^+$, $d_a^-$, $d_c^-$ (аналог четырёх направлений в \texttt{corridor\_sweeping}) и флаги наличия соседа $f_a^+$, $f_c^+$, $f_a^-$, $f_c^-$.
+
+Функция виртуального зазора (аналог параметра $w$ в коридорной модели):
+\begin{equation}
+  g(d, w, f) =
+  \begin{cases}
+    d, & f = \text{истина (сосед есть)},\\
+    w, & f = \text{ложь}.
+  \end{cases}
+\end{equation}
+Нелинейность $\xi(g) = \tanh(g)$. При нулевых составляющих скорости вдоль/поперёк отрезка ($v_{\mathrm{along}} = v_{\mathrm{cross}} = 0$ в коде для устойчивости к шуму) величины
+\begin{align}
+  \sigma_a &= v_{\mathrm{along}} - \xi\bigl(g(d_a^+, 0, f_a^+)\bigr) + \xi\bigl(g(d_a^-, 0, f_a^-)\bigr), \\
+  \sigma_c &= v_{\mathrm{cross}} - \xi\bigl(g(d_c^+, w_{\mathrm{cross}}, f_c^+)\bigr) + \xi\bigl(g(d_c^-, w_{\mathrm{cross}}, f_c^-)\bigr),
+\end{align}
+где $w_{\mathrm{cross}} = \texttt{W\_CROSS\_M}$. Для геометрической части вводятся: $p_A$ --- положение левого якоря; $p_i$ --- положение текущего внутреннего дрона; $s_i = (p_i - p_A)^\top u_{\mathrm{seg}}$ --- координата дрона вдоль отрезка; $s_{i^-}$ и $s_{i^+}$ --- координаты ближайших соседей слева и справа по отсортированной проекции на отрезок. Тогда ошибки выравнивания можно записать как
+\begin{equation}
+  e_{\mathrm{along}} = \frac{s_{i^-} + s_{i^+}}{2} - s_i, \qquad
+  e_{\mathrm{cross}} = (p_i - p_A)^\top n_{\mathrm{seg}}.
+\end{equation}
+Вектор ``комбинированной'' цели в NED:
+\begin{equation}
+  \begin{pmatrix} g_x \\ g_y \end{pmatrix}
+  = k_{\mathrm{along}} e_{\mathrm{along}} u_{\mathrm{seg}}
+  - k_{\mathrm{cross}} e_{\mathrm{cross}} n_{\mathrm{seg}}, \qquad
+  \begin{pmatrix} a_x \\ a_y \end{pmatrix}
+  = \sigma_a u_{\mathrm{seg}} + \sigma_c n_{\mathrm{seg}},
+\end{equation}
+\begin{equation}
+  \begin{pmatrix} c_x \\ c_y \end{pmatrix}
+  = \begin{pmatrix} g_x \\ g_y \end{pmatrix}
+  + w_A \begin{pmatrix} a_x \\ a_y \end{pmatrix},
+\end{equation}
+где $k_{\mathrm{along}} = \texttt{SPACING\_ALONG\_K}$, $k_{\mathrm{cross}} = \texttt{SPACING\_CROSS\_K}$, $w_A = \texttt{ANATOLIY\_COMB\_WEIGHT}$. Далее $(c_x, c_y)^\top$ переводится в базис корпуса $(\mathrm{fwd}, \mathrm{right})$, вычитается демпфирование по проекциям скорости NED на корпус с коэффициентом \texttt{INTERNAL\_BODY\_V\_DAMP}, и по ошибкам формируются приращения PWM пропорционально \texttt{INTERNAL\_RC\_KP} с ограничениями и наклоном (\texttt{\_slew\_int}).
+
+%---------------------------------------------------------------------
+\section{Физика и динамика полёта: ответственность SITL и Webots}
+
+\subsection{Роль кода Python в данном репозитории}
+
+Код Python в \texttt{Drone\_Swarm\_Simulator\_v2} \textbf{не} реализует уравнения жёсткого тела мультикоптера и не выполняет численное интегрирование положения/скорости аппарата. Кинематика и динамика носителя рассчитываются в \textbf{ArduPilot SITL} (встроенная модель мультикоптера) либо в \textbf{Webots} с передачей состояния обратно в SITL через интерфейс внешней FDM-модели.
+
+\subsection{Мультикоптер в SITL: иерархия классов и силы}
+
+В файле \texttt{SIM\_Multicopter.cpp} класс \texttt{MultiCopter} наследует \texttt{Aircraft}; метод \texttt{calculate\_forces} вызывает расчёт сил и моментов рамы (\texttt{frame->calculate\_forces}), формируя вектор углового ускорения в связанной системе $\dot{\omega}$ (в коде передаётся как \texttt{rot\_accel}) и линейное ускорение в связанной системе \texttt{accel\_body}. Затем \texttt{update\_dynamics(rot\_accel)} интегрирует состояние (см.\ ниже).
+
+\paragraph{Какую именно модель использует SITL.}
+Для мультикоптера в режиме \texttt{SITL-only} используется встроенная модель \texttt{SITL::MultiCopter} с типом рамы \texttt{FRAME\_CLASS = 1} (\emph{multirotor}) и \texttt{FRAME\_TYPE = 1} (\emph{X-class}) из файла \texttt{iris.parm}. По своей физической постановке это модель \textbf{жёсткого тела с шестью степенями свободы} (\textbf{6-DOF}): три поступательных степени свободы описывают движение центра масс в земной системе координат, а три вращательных степени свободы --- ориентацию и угловое движение корпуса. Силы и моменты формируются из вкладов отдельных роторов, причём для каждого ротора учитываются команда двигателя, напряжение батареи, плотность воздуха, входная скорость потока на винт, реактивный момент и аэродинамическое сопротивление. Следовательно, SITL в данном проекте использует не упрощённую кинематическую модель точки, а полноценную жёсткотельную модель мультикоптера с расчётом тяги, моментов и последующим интегрированием состояния.
+
+\paragraph{Используемая модель коптера и автопилотной платформы.}
+Если понимать ``модель коптера'' как тип виртуального летательного аппарата (по аналогии с \texttt{Mavic}, \texttt{Crazyflie} и т.\,п.), то в данном проекте используется не специализированная потребительская платформа такого класса, а стандартная мультикоптерная конфигурация \textbf{ArduPilot ArduCopter}. Лаунчер запускает \texttt{sim\_vehicle.py} с ключом \texttt{-v ArduCopter}, а в самом ArduPilot для \texttt{ArduCopter} по умолчанию выбирается рама \texttt{quad}. Дополнительно файл параметров проекта \texttt{iris.parm} задаёт \texttt{FRAME\_CLASS = 1} (\emph{multirotor}) и \texttt{FRAME\_TYPE = 1} (\emph{X-class}). Следовательно, наиболее точное описание аппаратной модели в рамках данного стенда --- это \textbf{четырёхроторный мультикоптер X-конфигурации под управлением ArduCopter}; в терминологии практического моделирования такую платформу можно считать \emph{iris-like} конфигурацией ArduPilot, но не моделью \texttt{DJI Mavic} и не моделью \texttt{Crazyflie}.
+
+Над этой динамической моделью работает штатный программный стек \texttt{ArduPilot ArduCopter}, включающий обработку режимов полёта, оценивание состояния и внутренние контуры стабилизации. В рассматриваемом проекте сценарии взаимодействуют с этой прошивкой через MAVLink-команды смены режима и через \texttt{RC\_OVERRIDE}; в частности, используются режимы \texttt{GUIDED}, \texttt{POS\_HOLD}, \texttt{BRAKE} и \texttt{LAND}. По логике ArduCopter это каскадная система управления: внешний контур по положению формирует требуемую скорость, контур скорости формирует требуемое ускорение или эквивалентные целевые углы наклона, далее контур ориентации формирует требуемые угловые скорости, а внутренний скоростной контур по крену, тангажу и рысканию преобразует эти требования в моторные команды. Поэтому управляющий код Python в проекте задаёт лишь внешний уровень целеуказания, тогда как непосредственная стабилизация коптера реализуется прошивкой \texttt{ArduCopter}.
+
+\subsection{Дискретное обновление в \texttt{Aircraft::update\_dynamics}}
+
+В \texttt{SIM\_Aircraft.cpp} используется шаг по времени $\Delta t$, вычисляемый из \texttt{frame\_time\_us}. Обозначим: $\omega$ --- вектор угловой скорости в связанной системе (в коде накапливается в переменной \texttt{gyro} как угловая скорость); $R$ --- матрица направляющих косинусов (переход из связанной системы в земную, \texttt{dcm}); $a_b$ --- ускорение в связанной системе до учёта показаний акселерометра (\texttt{accel\_body} после сил двигателей); $g$ --- ускорение свободного падения, $g = (0,\,0,\,G)^\top$ в земной системе с осью $z$ вниз (\texttt{GRAVITY\_MSS}); $v$ --- скорость в земной системе (\texttt{velocity\_ef}); $p$ --- положение (\texttt{position}).
+
+Последовательность в явном виде в коде:
+\begin{align}
+  \omega &\leftarrow \omega + \dot{\omega}\,\Delta t, \\
+  R &\leftarrow R \cdot \Delta R(\omega\,\Delta t), \\
+  a_e &= R\, a_b + g, \\
+  v &\leftarrow v + a_e\,\Delta t, \\
+  p &\leftarrow p + v\,\Delta t,
+\end{align}
+с последующим пересчётом \texttt{accel\_body} как «кинематическое ускорение + гравитация», видимое акселерометром (строки с \texttt{accel\_body = dcm.transposed() * (\ldots)}). Здесь $\Delta R(\omega\,\Delta t)$ --- малый поворот за шаг $\Delta t$, соответствующий вызову \texttt{dcm.rotate(gyro * delta\_time)}.
+
+Непрерывный аналог удобно записать как систему Ньютона--Эйлера. Пусть $m$ --- масса аппарата; $f_b \in \mathbb{R}^3$ --- результирующая сила в связанных осях; $M_b \in \mathbb{R}^3$ --- результирующий момент в связанных осях; $J \in \mathbb{R}^{3\times 3}$ --- тензор инерции; $\omega \in \mathbb{R}^3$ --- угловая скорость; $R \in SO(3)$ --- матрица поворота из связанной системы в земную; $p \in \mathbb{R}^3$ --- положение; $v \in \mathbb{R}^3$ --- линейная скорость; $g \in \mathbb{R}^3$ --- вектор ускорения свободного падения. Тогда
+\begin{align}
+  \dot{p} &= v, \\
+  m \dot{v} &= R f_b + m g, \\
+  J \dot{\omega} &= M_b - \omega \times (J \omega), \\
+  \dot{R} &= R\,S(\omega),
+\end{align}
+где $S(\omega)$ --- кососимметричная матрица, задающая оператор векторного произведения: $S(\omega) x = \omega \times x$ для любого $x \in \mathbb{R}^3$. В коде детали формирования $f_b$ и $M_b$ скрыты в \texttt{frame->calculate\_forces}, а \texttt{update\_dynamics} реализует их численное интегрирование явным шагом.
+
+Поэтому модель полёта удобно характеризовать как \textbf{шестистепенную модель жёсткого тела} (6-DOF): три поступательных и три вращательных степени свободы. По порядку уравнений это две подсистемы второго порядка (поступательная и вращательная), а в форме пространства состояний первого порядка --- \textbf{12-мерная модель}, если вектор состояния взять в виде $x = (p^\top, \eta^\top, v^\top, \omega^\top)^\top$, где $\eta$ --- тройка параметров ориентации (например, углы Эйлера).
+
+\paragraph{Формулировка для дипломного текста.}
+Таким образом, полётная динамика в рассматриваемом стенде моделируется встроенной подсистемой \texttt{ArduPilot SITL MultiCopter}. Эта подсистема реализует пространственную жёсткотельную модель мультикоптера типа ``X'' с шестью степенями свободы. С математической точки зрения модель включает поступательное движение центра масс и вращательное движение корпуса под действием суммарной тяги роторов, реактивных моментов и аэродинамического сопротивления. По порядку исходных дифференциальных уравнений это связанная система второго порядка для линейного и углового движения, а после приведения к нормальной форме Коши она эквивалентна системе \textbf{12 дифференциальных уравнений первого порядка} по координатам, скоростям, ориентации и угловым скоростям летательного аппарата.
+
+\subsection{Параметр \texttt{SCHED\_LOOP\_RATE}}
+
+В файле \texttt{config/iris.parm} задано \texttt{SCHED\_LOOP\_RATE 300}: частота основного цикла планировщика автопилота в симуляции порядка 300~Гц. Обмен сообщениями MAVLink и логика координации роя в Python работают на существенно более низких внешних частотах (десятки герц), т.\,е.\ это внешние контуры относительно быстрого внутреннего контура автопилота.
+
+\subsection{Режим Webots (\texttt{SIM\_Webots\_Python.cpp})}
+
+Класс \texttt{WebotsPython} получает от внешней FDM (Webots) пакет \texttt{fdm\_packet}: линейное ускорение IMU в связанных осях, угловую скорость, углы ориентации, вектор скорости и положение в земной системе; эти величины записываются в \texttt{accel\_body}, \texttt{gyro}, \texttt{dcm}, \texttt{velocity\_ef}, \texttt{position}. Управляющие входы передаются в Webots как нормированные скорости моторов (\texttt{send\_servos}). Таким образом, в режиме Webots интегрирование динамики выполняет движок Webots; SITL использует возвращаемое состояние для согласования с остальной цепочкой автопилота.
+
+%---------------------------------------------------------------------
+\section{Заключение}
+
+Проект \texttt{Drone\_Swarm\_Simulator\_v2} связывает несколько автономных SITL-автопилотов с одним координирующим процессом Python: телеметрия позиции и ориентации запрашивается на 50~Гц, цикл обмена координатами по умолчанию согласован с $f_{\mathrm{exch}} = 50$~Гц, поддержание RC --- каждые $0{,}2$~с, визуализатор опционально получает JSON по UDP на \texttt{127.0.0.1:15551}. Динамика носителя определяется ArduPilot SITL (класс \texttt{MultiCopter} и интегратор \texttt{Aircraft::update\_dynamics}) либо Webots через \texttt{WebotsPython}.
+
+\end{document}
