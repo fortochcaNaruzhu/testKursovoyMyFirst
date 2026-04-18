@@ -1,0 +1,6 @@
+# ROS Noetic + python3-tk for replay GUI (no apt-get at runtime).
+# Build: docker build -f docker/Dockerfile.replay-rviz-gui -t swarm-replay-rviz-gui:noetic .
+FROM osrf/ros:noetic-desktop-full
+
+RUN apt-get update -qq && apt-get install -y -qq python3-tk \
+    && rm -rf /var/lib/apt/lists/*

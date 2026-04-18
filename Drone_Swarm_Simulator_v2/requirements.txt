@@ -1,0 +1,7 @@
+# Formatting & linting (ТЗ: стандарты Python)
+black>=24.0
+ruff>=0.15
+
+# Plotting experiment CSV (scripts/plot_experiment_csv.py)
+matplotlib>=3.7
+numpy>=1.24

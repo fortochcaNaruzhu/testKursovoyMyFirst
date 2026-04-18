@@ -1,0 +1,7 @@
+{
+  "duration_sec": 63.934,
+  "collision_radius_m": 0.2,
+  "num_drones": 2,
+  "scenario": "converted_from_follower_pair_csv",
+  "source_file": "/home/user/Kursov3/Drone_Swarm_Simulator_v2/logs/two_drones_log_run_follower_2.csv"
+}
