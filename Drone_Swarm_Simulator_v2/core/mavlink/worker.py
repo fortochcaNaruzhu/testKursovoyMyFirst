@@ -11,7 +11,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pymavlink import mavutil
 
@@ -39,8 +39,13 @@ class MAVLinkWorker:
         self.drone_id = drone_id
         self._command_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
         self._state_lock = threading.Lock()
+        # Condition is used to wait for new position samples (LOCAL_POSITION_NED).
+        # It shares the same underlying lock to keep state + counters consistent.
+        self._pos_cond = threading.Condition(self._state_lock)
         self._last_position: Optional[Dict[str, float]] = None
         self._last_attitude: Optional[Dict[str, float]] = None
+        self._pos_seq: int = 0
+        self._att_seq: int = 0
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._master: Any = None
@@ -111,12 +116,16 @@ class MAVLinkWorker:
                             "vy": getattr(msg, "vy", 0.0),
                             "vz": getattr(msg, "vz", 0.0),
                         }
+                        self._pos_seq += 1
+                        # Wake up any logger waiting for a new sample.
+                        self._pos_cond.notify_all()
                     elif msg.get_type() == "ATTITUDE":
                         self._last_attitude = {
                             "rx": msg.roll,
                             "ry": msg.pitch,
                             "rz": msg.yaw,
                         }
+                        self._att_seq += 1
 
             time.sleep(0.01)
 
@@ -258,6 +267,40 @@ class MAVLinkWorker:
             if self._last_attitude is None:
                 return None
             return dict(self._last_attitude)
+
+    def get_position_seq(self) -> int:
+        """Return current LOCAL_POSITION_NED sequence number (monotonic)."""
+        with self._state_lock:
+            return int(self._pos_seq)
+
+    def wait_for_new_position(
+        self, last_seq: int, timeout_s: float = 0.25
+    ) -> Optional[Tuple[int, Dict[str, float]]]:
+        """
+        Block until a new LOCAL_POSITION_NED sample arrives (seq changes).
+
+        Args:
+            last_seq: Previously seen sequence number.
+            timeout_s: Max seconds to wait.
+
+        Returns:
+            (new_seq, position_dict) or None on timeout / if no position yet.
+        """
+        deadline = time.time() + float(timeout_s)
+        with self._state_lock:
+            while self._pos_seq <= int(last_seq) and self._running:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._pos_cond.wait(timeout=remaining)
+            if self._pos_seq <= int(last_seq) or self._last_position is None:
+                return None
+            return (int(self._pos_seq), dict(self._last_position))
+
+    def get_attitude_seq(self) -> int:
+        """Return current ATTITUDE sequence number (monotonic)."""
+        with self._state_lock:
+            return int(self._att_seq)
 
     def run_init_sequence(
         self, steps: List[Dict[str, Any]], timeout: float = 60.0

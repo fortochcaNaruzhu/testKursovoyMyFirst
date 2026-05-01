@@ -363,7 +363,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     parser = argparse.ArgumentParser(description="antena_logic: nearest-neighbor vertical antenna (rc_override)")
-    parser.add_argument("--drones", type=int, default=4, help="Launcher compatibility; coerced to 4")
+    parser.add_argument("--drones", type=int, default=4, help="Number of drones (>=2; recommended >=4)")
     parser.add_argument("--duration", type=float, default=0.0, help="Run duration (s); 0 = infinite")
     parser.add_argument("--heartbeat-timeout", type=float, default=12.0, help="Heartbeat timeout (s)")
     parser.add_argument("--exchange-hz", type=float, default=50.0, help="Accepted for launcher compatibility; ignored.")
@@ -393,13 +393,17 @@ def main() -> None:
         default=20.0,
         help="Log write rate (Hz). 0 = write every exchange tick (50 Hz).",
     )
+    parser.add_argument(
+        "--log-mode",
+        type=str,
+        default="timer",
+        choices=["timer", "mavlink"],
+        help="CSV logging mode. 'timer' logs at --log-hz. 'mavlink' logs each new LOCAL_POSITION_NED sample.",
+    )
 
     args = parser.parse_args()
 
-    num_drones = int(args.drones)
-    if num_drones != 4:
-        logger.info("[antena_logic] Coercing --drones from %d to 4.", num_drones)
-        num_drones = 4
+    num_drones = max(1, int(args.drones))
 
     anchor_id = int(args.anchor_id)
     if anchor_id < 1 or anchor_id > num_drones:
@@ -489,6 +493,7 @@ def main() -> None:
             "xy_vis_m": float(args.xy_vis),
             "anchor_id": anchor_id,
             "log_hz": float(args.log_hz),
+            "log_mode": str(args.log_mode),
         },
     )
     logger.info("[antena_logic] Logging RViz replay CSVs to: %s", experiment_dir)
@@ -500,6 +505,8 @@ def main() -> None:
         last_log_time = 0.0
         log_hz = float(getattr(args, "log_hz", 20.0))
         log_period = (1.0 / log_hz) if log_hz and log_hz > 0 else 0.0
+        log_mode = str(getattr(args, "log_mode", "timer"))
+        last_pos_seq = {int(c.config["id"]): 0 for c in controllers}
         while True:
             if STOP_EVENT.is_set():
                 return
@@ -514,10 +521,20 @@ def main() -> None:
                         c.update_other_drone_position(did, pos)
             # Write per-drone CSV logs for RViz replay (NED, common frame).
             now = time.time()
-            if log_period <= 0.0 or (now - last_log_time) >= log_period:
-                t_rel = now - START_TIME if START_TIME > 0 else 0.0
+            if log_mode == "mavlink":
+                # Log one row per new LOCAL_POSITION_NED sample per drone.
+                # This avoids duplicate plateau rows caused by reading the same cached position.
                 for c in controllers:
                     did = int(c.config["id"])
+                    w = getattr(c, "worker", None)
+                    if w is None:
+                        continue
+                    res = w.wait_for_new_position(last_pos_seq.get(did, 0), timeout_s=0.0)
+                    if res is None:
+                        continue
+                    seq, _pos_raw = res
+                    last_pos_seq[did] = seq
+                    t_rel = time.time() - START_TIME if START_TIME > 0 else 0.0
                     p = pos_common.get(did) or {"x": 0.0, "y": 0.0, "z": 0.0}
                     att = {"rx": 0.0, "ry": 0.0, "rz": 0.0}
                     if c.coords_monitor is not None:
@@ -540,7 +557,34 @@ def main() -> None:
                         )
                     except Exception:
                         pass
-                last_log_time = now
+            else:
+                if log_period <= 0.0 or (now - last_log_time) >= log_period:
+                    t_rel = now - START_TIME if START_TIME > 0 else 0.0
+                    for c in controllers:
+                        did = int(c.config["id"])
+                        p = pos_common.get(did) or {"x": 0.0, "y": 0.0, "z": 0.0}
+                        att = {"rx": 0.0, "ry": 0.0, "rz": 0.0}
+                        if c.coords_monitor is not None:
+                            try:
+                                att = c.coords_monitor.get_attitude()
+                            except Exception:
+                                att = att
+                        try:
+                            write_row(
+                                experiment_log_files[did],
+                                did,
+                                float(t_rel),
+                                float(p.get("x", 0.0)),
+                                float(p.get("y", 0.0)),
+                                float(p.get("z", 0.0)),
+                                float(att.get("rx", 0.0)),
+                                float(att.get("ry", 0.0)),
+                                float(att.get("rz", 0.0)),
+                                0,
+                            )
+                        except Exception:
+                            pass
+                    last_log_time = now
             if _publish_positions is not None and (now - last_pub) >= pub_period:
                 try:
                     _publish_positions(pos_common, rates={"exchange_hz": 1.0 / 0.02})

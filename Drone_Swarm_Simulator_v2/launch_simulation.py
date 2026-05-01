@@ -523,6 +523,16 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--log-mode",
+        type=str,
+        default=None,
+        choices=["timer", "mavlink"],
+        help=(
+            "Scenario-specific: CSV logging mode. Currently forwarded only to "
+            "scenario 'antena_logic' as --log-mode."
+        ),
+    )
+    parser.add_argument(
         "--sitl-heartbeat-timeout",
         type=float,
         default=120.0,
@@ -720,6 +730,9 @@ Examples:
     exchange_hz = getattr(args, "exchange_hz", 50.0)
     if exchange_hz > 0:
         scenario_cmd.extend(["--exchange-hz", str(exchange_hz)])
+    # Forward scenario-specific args only when supported by that scenario.
+    if scenario_id == "antena_logic" and getattr(args, "log_mode", None):
+        scenario_cmd.extend(["--log-mode", str(args.log_mode)])
     scenario_proc = subprocess.Popen(
         scenario_cmd,
         cwd=scenario_cwd,

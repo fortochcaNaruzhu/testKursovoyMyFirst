@@ -153,4 +153,8 @@ python launch_simulation.py -s -c antena_logic --duration 60 --run-id test3
 
 cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
 source /opt/ros/jazzy/setup.bash
-python3 replay/replay_rviz2.py --experiment experiments/exp_test1 --rate 1.0 --rviz --viz-substeps 8 --viz-cap-hz 0
+python3 replay/replay_rviz2.py --experiment experiments/exp_test3 --rate 1.0 --rviz --viz-substeps 8 --viz-cap-hz 0
+
+source /opt/ros/jazzy/setup.bash
+cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+python3 replay/replay_rviz2.py --experiment experiments/2026-04-19_17-16-19 --rviz --interactive --timeline-ui

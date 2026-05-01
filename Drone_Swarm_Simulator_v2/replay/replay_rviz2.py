@@ -13,6 +13,7 @@ Optional: same interactive topics as ROS1 (/replay/play, pause, seek, speed).
 Usage (from project root, after: source /opt/ros/jazzy/setup.bash):
   python replay/replay_rviz2.py --experiment experiments/exp_1 --rate 1.0
   python replay/replay_rviz2.py --experiment experiments/exp_1 --rviz   # + RViz2 автоматически
+  # По умолчанию маркеры — visualizer/models/iris.dae; сферы: --marker-spheres
 """
 
 from __future__ import annotations
@@ -74,6 +75,42 @@ def _quaternion_from_euler(roll: float, pitch: float, yaw: float) -> Tuple[float
     z = cr * cp * sy - sr * sp * cy
     return (x, y, z, w)
 
+def _quat_conj(q: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    x, y, z, w = q
+    return (-x, -y, -z, w)
+
+
+def _quat_mul(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> Tuple[float, float, float, float]:
+    """Quaternion multiplication (x,y,z,w) ⊗ (x,y,z,w)."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+# Rotation that maps NED basis to ENU basis used above:
+# (x_north, y_east, z_down) -> (x_enu=y_east, y_enu=x_north, z_enu=-z_down)
+# This is a 180° rotation about axis (1,1,0)/sqrt(2).
+_Q_NED_TO_ENU: Tuple[float, float, float, float] = (
+    1.0 / math.sqrt(2.0),
+    1.0 / math.sqrt(2.0),
+    0.0,
+    0.0,
+)
+
+
+def _quat_ned_to_enu(q_ned: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    """Convert orientation from NED world frame to ENU world frame."""
+    t = _Q_NED_TO_ENU
+    return _quat_mul(_quat_mul(t, q_ned), _quat_conj(t))
+
 
 def _ned_to_enu(x: float, y: float, z: float) -> Tuple[float, float, float]:
     """NED → ENU for RViz (x_north→y, y_east→x, z_down→-z)."""
@@ -91,6 +128,7 @@ def _row_to_pose_stamped(
     qx, qy, qz, qw = _quaternion_from_euler(
         float(row["rx"]), float(row["ry"]), float(row["rz"])
     )
+    qx, qy, qz, qw = _quat_ned_to_enu((qx, qy, qz, qw))
     msg = PoseStamped()
     msg.header.frame_id = frame_id
     msg.header.stamp = node.get_clock().now().to_msg()
@@ -117,16 +155,36 @@ _MARKER_PALETTE: List[Tuple[float, float, float]] = [
 ]
 
 
+def _default_iris_mesh_path() -> str:
+    """Bundled Collada mesh next to the repo (visualizer/models/iris.dae)."""
+    return os.path.join(_replay_parent, "visualizer", "models", "iris.dae")
+
+
+def _mesh_resource_uri(local_path: str) -> str:
+    """Absolute path → file:// URI for Marker.mesh_resource (POSIX)."""
+    ap = os.path.abspath(os.path.expanduser(local_path))
+    if ap.startswith(os.sep):
+        return "file://" + ap
+    return "file:///" + ap.replace(os.sep, "/")
+
+
 def _rows_to_marker_array(
     step_list: List[Optional[Dict[str, Any]]],
     node: Node,
     frame_id: str,
+    *,
+    mesh_resource_uri: Optional[str] = None,
+    mesh_scale: float = 1.0,
     sphere_scale: float = 0.45,
 ) -> MarkerArray:
-    """Build MarkerArray (spheres, one per drone) for RViz2 MarkerArray display."""
+    """Build MarkerArray for RViz2: optional Collada mesh (e.g. iris.dae) or colored spheres."""
     out = MarkerArray()
     stamp = node.get_clock().now().to_msg()
     n_palette = len(_MARKER_PALETTE)
+    use_mesh = bool(mesh_resource_uri)
+    ms = float(mesh_scale)
+    if ms <= 0:
+        ms = 1.0
     for i, row in enumerate(step_list):
         if row is None:
             continue
@@ -136,7 +194,6 @@ def _rows_to_marker_array(
         m.header.stamp = stamp
         m.ns = "swarm"
         m.id = drone_id
-        m.type = Marker.SPHERE
         m.action = Marker.ADD
         enu_x, enu_y, enu_z = _ned_to_enu(
             float(row["x"]), float(row["y"]), float(row["z"])
@@ -144,6 +201,7 @@ def _rows_to_marker_array(
         qx, qy, qz, qw = _quaternion_from_euler(
             float(row["rx"]), float(row["ry"]), float(row["rz"])
         )
+        qx, qy, qz, qw = _quat_ned_to_enu((qx, qy, qz, qw))
         m.pose.position.x = enu_x
         m.pose.position.y = enu_y
         m.pose.position.z = enu_z
@@ -151,14 +209,28 @@ def _rows_to_marker_array(
         m.pose.orientation.y = qy
         m.pose.orientation.z = qz
         m.pose.orientation.w = qw
-        m.scale.x = sphere_scale
-        m.scale.y = sphere_scale
-        m.scale.z = sphere_scale
-        pr, pg, pb = _MARKER_PALETTE[(drone_id - 1) % n_palette]
-        col = ColorRGBA(r=pr, g=pg, b=pb, a=1.0)
-        if int(row.get("hasCollision", 0)):
-            col = ColorRGBA(r=1.0, g=0.2, b=0.2, a=1.0)
-        m.color = col
+        collision = int(row.get("hasCollision", 0))
+        if use_mesh:
+            m.type = Marker.MESH_RESOURCE
+            m.mesh_resource = mesh_resource_uri or ""
+            m.mesh_use_embedded_materials = collision == 0
+            m.scale.x = ms
+            m.scale.y = ms
+            m.scale.z = ms
+            if collision:
+                m.color = ColorRGBA(r=1.0, g=0.2, b=0.2, a=1.0)
+            else:
+                m.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+        else:
+            m.type = Marker.SPHERE
+            m.scale.x = sphere_scale
+            m.scale.y = sphere_scale
+            m.scale.z = sphere_scale
+            pr, pg, pb = _MARKER_PALETTE[(drone_id - 1) % n_palette]
+            col = ColorRGBA(r=pr, g=pg, b=pb, a=1.0)
+            if collision:
+                col = ColorRGBA(r=1.0, g=0.2, b=0.2, a=1.0)
+            m.color = col
         m.lifetime.sec = 0
         m.lifetime.nanosec = 0
         out.markers.append(m)
@@ -217,6 +289,10 @@ def _publish_step_poses_and_markers(
     markers_pub: Optional[Any],
     frame_id: str,
     publish_markers: bool,
+    *,
+    marker_mesh_uri: Optional[str] = None,
+    marker_mesh_scale: float = 1.0,
+    marker_sphere_scale: float = 0.45,
 ) -> None:
     for i, row in enumerate(step_list):
         if row is None:
@@ -224,7 +300,16 @@ def _publish_step_poses_and_markers(
         drone_id = i + 1
         pose_pubs[drone_id].publish(_row_to_pose_stamped(row, node, frame_id=frame_id))
     if publish_markers and markers_pub is not None:
-        markers_pub.publish(_rows_to_marker_array(step_list, node, frame_id))
+        markers_pub.publish(
+            _rows_to_marker_array(
+                step_list,
+                node,
+                frame_id,
+                mesh_resource_uri=marker_mesh_uri,
+                mesh_scale=marker_mesh_scale,
+                sphere_scale=marker_sphere_scale,
+            )
+        )
 
 
 def _keyboard_loop(state: PlaybackState, step_times: List[float], shutdown_event: threading.Event) -> None:
@@ -263,6 +348,123 @@ def _keyboard_loop(state: PlaybackState, step_times: List[float], shutdown_event
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+def _timeline_ui_thread(
+    state: PlaybackState,
+    step_times: List[float],
+    shutdown_event: threading.Event,
+    title: str = "Swarm Replay",
+) -> None:
+    """Optional local UI (Tk slider + play/pause) for interactive replay."""
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except Exception as e:
+        logger.warning(
+            "Timeline UI недоступен (tkinter import failed: %s). "
+            "На Ubuntu обычно решается пакетом python3-tk.",
+            e,
+        )
+        return
+
+    n = len(step_times)
+    if n <= 0:
+        return
+
+    root = tk.Tk()
+    root.title(title)
+    root.geometry("520x160")
+
+    def on_close() -> None:
+        shutdown_event.set()
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    def toggle_play() -> None:
+        state.toggle_playing()
+
+    def step_prev() -> None:
+        playing, idx, _ = state.get_state()
+        if playing:
+            state.set_playing(False)
+        state.set_index(idx - 1)
+
+    def step_next() -> None:
+        playing, idx, _ = state.get_state()
+        if playing:
+            state.set_playing(False)
+        state.set_index(idx + 1)
+
+    dragging = {"active": False}
+
+    def on_slider_press(_: object = None) -> None:
+        dragging["active"] = True
+
+    def on_slider_release(_: object = None) -> None:
+        dragging["active"] = False
+
+    def on_slider_changed(v: str) -> None:
+        if not dragging["active"]:
+            return
+        try:
+            state.set_index(int(float(v)))
+        except Exception:
+            return
+
+    frm = ttk.Frame(root, padding=10)
+    frm.pack(fill="both", expand=True)
+
+    status_var = tk.StringVar(value="")
+    ttk.Label(frm, textvariable=status_var).pack(anchor="w")
+
+    scale = ttk.Scale(
+        frm,
+        from_=0,
+        to=max(0, n - 1),
+        orient="horizontal",
+        command=on_slider_changed,
+    )
+    scale.pack(fill="x", pady=10)
+    scale.bind("<ButtonPress-1>", on_slider_press)
+    scale.bind("<ButtonRelease-1>", on_slider_release)
+
+    btns = ttk.Frame(frm)
+    btns.pack(fill="x")
+    ttk.Button(btns, text="⟵ Step", command=step_prev).pack(side="left")
+    ttk.Button(btns, text="Play/Pause", command=toggle_play).pack(side="left", padx=8)
+    ttk.Button(btns, text="Step ⟶", command=step_next).pack(side="left")
+    ttk.Button(btns, text="Stop", command=on_close).pack(side="right")
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
+    def refresh() -> None:
+        if shutdown_event.is_set():
+            on_close()
+            return
+        playing, idx, speed = state.get_state()
+        idx = max(0, min(n - 1, idx))
+        t = step_times[idx] if idx < len(step_times) else 0.0
+        t0 = step_times[0] if step_times else 0.0
+        t1 = step_times[-1] if step_times else 0.0
+        status_var.set(
+            f"{'PLAY' if playing else 'PAUSE'}  "
+            f"idx={idx+1}/{n}  t={t:.3f}s  speed={speed:.2f}x  duration={max(0.0, t1 - t0):.3f}s"
+        )
+        if not dragging["active"]:
+            try:
+                scale.set(idx)
+            except Exception:
+                pass
+        root.after(100, refresh)
+
+    root.after(100, refresh)
+    try:
+        root.mainloop()
+    except Exception:
+        shutdown_event.set()
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Replay experiment in RViz 2 (ROS 2).")
     p.add_argument(
@@ -283,6 +485,16 @@ def _parse_args() -> argparse.Namespace:
         help="Play/pause, seek, speed via keyboard and /replay/* topics.",
     )
     p.add_argument(
+        "--start-paused",
+        action="store_true",
+        help="Только с --interactive: старт на паузе (Space — play). По умолчанию сразу идёт воспроизведение.",
+    )
+    p.add_argument(
+        "--timeline-ui",
+        action="store_true",
+        help="Только с --interactive: открыть локальное окно с таймлайном (ползунок) и кнопками Play/Pause.",
+    )
+    p.add_argument(
         "--frame-id",
         type=str,
         default="world",
@@ -292,6 +504,35 @@ def _parse_args() -> argparse.Namespace:
         "--no-markers",
         action="store_true",
         help="Do not publish /swarm/markers (only per-drone /swarm/drone_N/pose).",
+    )
+    p.add_argument(
+        "--marker-spheres",
+        action="store_true",
+        help="Использовать цветные сферы вместо меша (по умолчанию — iris.dae из visualizer/models).",
+    )
+    p.add_argument(
+        "--marker-mesh",
+        type=str,
+        default="",
+        metavar="PATH",
+        help=(
+            "Путь к .dae/.stl для Marker.MESH_RESOURCE. Пусто = visualizer/models/iris.dae "
+            "(если файл есть), иначе сферы."
+        ),
+    )
+    p.add_argument(
+        "--marker-mesh-scale",
+        type=float,
+        default=1.0,
+        metavar="S",
+        help="Равномерный масштаб меша (RViz scale.x/y/z). По умолчанию 1.0.",
+    )
+    p.add_argument(
+        "--marker-sphere-scale",
+        type=float,
+        default=0.45,
+        metavar="S",
+        help="Диаметр/масштаб сферы при --marker-spheres (метры).",
     )
     p.add_argument(
         "--rviz",
@@ -457,6 +698,10 @@ def _run_linear(
     viz_substeps: int,
     viz_cap_hz: float,
     spatial_step_m: float = 0.0,
+    *,
+    marker_mesh_uri: Optional[str] = None,
+    marker_mesh_scale: float = 1.0,
+    marker_sphere_scale: float = 0.45,
 ) -> None:
     nseg = max(1, int(viz_substeps))
     use_interp = nseg > 1 or spatial_step_m > 0
@@ -466,7 +711,15 @@ def _run_linear(
             if not rclpy.ok():
                 break
             _publish_step_poses_and_markers(
-                node, step_list, pose_pubs, markers_pub, frame_id, publish_markers
+                node,
+                step_list,
+                pose_pubs,
+                markers_pub,
+                frame_id,
+                publish_markers,
+                marker_mesh_uri=marker_mesh_uri,
+                marker_mesh_scale=marker_mesh_scale,
+                marker_sphere_scale=marker_sphere_scale,
             )
             dt = t - prev_t
             prev_t = t
@@ -479,7 +732,15 @@ def _run_linear(
     if not steps:
         return
     _publish_step_poses_and_markers(
-        node, steps[0][1], pose_pubs, markers_pub, frame_id, publish_markers
+        node,
+        steps[0][1],
+        pose_pubs,
+        markers_pub,
+        frame_id,
+        publish_markers,
+        marker_mesh_uri=marker_mesh_uri,
+        marker_mesh_scale=marker_mesh_scale,
+        marker_sphere_scale=marker_sphere_scale,
     )
     rclpy.spin_once(node, timeout_sec=0.0)
     for i in range(len(steps) - 1):
@@ -495,7 +756,15 @@ def _run_linear(
             alpha = k / seg
             sl = _interpolate_step_lists(s0, s1, alpha)
             _publish_step_poses_and_markers(
-                node, sl, pose_pubs, markers_pub, frame_id, publish_markers
+                node,
+                sl,
+                pose_pubs,
+                markers_pub,
+                frame_id,
+                publish_markers,
+                marker_mesh_uri=marker_mesh_uri,
+                marker_mesh_scale=marker_mesh_scale,
+                marker_sphere_scale=marker_sphere_scale,
             )
             if rate > 0:
                 time.sleep(dt / seg / rate)
@@ -522,6 +791,10 @@ def _run_interactive(
     viz_substeps: int,
     viz_cap_hz: float,
     spatial_step_m: float = 0.0,
+    *,
+    marker_mesh_uri: Optional[str] = None,
+    marker_mesh_scale: float = 1.0,
+    marker_sphere_scale: float = 0.45,
 ) -> None:
     step_times = [s[0] for s in steps]
     n = len(steps)
@@ -574,7 +847,15 @@ def _run_interactive(
                 alpha = k / seg
                 sl = _interpolate_step_lists(s0, s1, alpha)
                 _publish_step_poses_and_markers(
-                    node, sl, pose_pubs, markers_pub, frame_id, publish_markers
+                    node,
+                    sl,
+                    pose_pubs,
+                    markers_pub,
+                    frame_id,
+                    publish_markers,
+                    marker_mesh_uri=marker_mesh_uri,
+                    marker_mesh_scale=marker_mesh_scale,
+                    marker_sphere_scale=marker_sphere_scale,
                 )
                 if speed > 0:
                     time.sleep(dt / seg / speed)
@@ -582,7 +863,15 @@ def _run_interactive(
             state.advance_index()
         else:
             _publish_step_poses_and_markers(
-                node, step_list, pose_pubs, markers_pub, frame_id, publish_markers
+                node,
+                step_list,
+                pose_pubs,
+                markers_pub,
+                frame_id,
+                publish_markers,
+                marker_mesh_uri=marker_mesh_uri,
+                marker_mesh_scale=marker_mesh_scale,
+                marker_sphere_scale=marker_sphere_scale,
             )
             if playing and idx < n - 1:
                 next_t = steps[idx + 1][0]
@@ -630,6 +919,27 @@ def main() -> None:
     viz_substeps = max(1, raw_vs)
     viz_cap_hz = max(0.0, float(args.viz_cap_hz))
     spatial_step_m = max(0.0, float(getattr(args, "viz_spatial_step_m", 0.0)))
+
+    marker_sphere_scale = max(0.01, float(args.marker_sphere_scale))
+    marker_mesh_scale = max(0.01, float(args.marker_mesh_scale))
+    marker_mesh_uri: Optional[str] = None
+    if args.marker_spheres:
+        logger.info("Маркеры RViz: сферы (масштаб %.3f м).", marker_sphere_scale)
+    else:
+        mesh_path = (args.marker_mesh or "").strip() or _default_iris_mesh_path()
+        if os.path.isfile(mesh_path):
+            marker_mesh_uri = _mesh_resource_uri(mesh_path)
+            logger.info(
+                "Маркеры RViz: mesh %s (uniform scale %.3f).",
+                mesh_path,
+                marker_mesh_scale,
+            )
+        else:
+            logger.warning(
+                "Файл меша не найден (%s) — используются сферы. "
+                "Положите iris.dae в visualizer/models или задайте --marker-mesh.",
+                mesh_path,
+            )
 
     rclpy.init()
     node = Node("swarm_replay")
@@ -713,7 +1023,26 @@ def main() -> None:
 
     try:
         if args.interactive:
-            state = PlaybackState(num_steps=len(steps), initial_speed=rate)
+            state = PlaybackState(
+                num_steps=len(steps),
+                initial_speed=rate,
+                start_paused=args.start_paused,
+            )
+            if args.timeline_ui:
+                step_times = [s[0] for s in steps]
+                threading.Thread(
+                    target=_timeline_ui_thread,
+                    args=(state, step_times, shutdown_event),
+                    daemon=True,
+                ).start()
+            if args.start_paused:
+                logger.info(
+                    "Интерактив: старт на паузе — нажмите Space в терминале replay для воспроизведения."
+                )
+            else:
+                logger.info(
+                    "Интерактив: воспроизведение включено; Space — пауза/продолжение."
+                )
             _run_interactive(
                 node,
                 steps,
@@ -729,6 +1058,9 @@ def main() -> None:
                 viz_substeps=viz_substeps,
                 viz_cap_hz=viz_cap_hz,
                 spatial_step_m=spatial_step_m,
+                marker_mesh_uri=marker_mesh_uri,
+                marker_mesh_scale=marker_mesh_scale,
+                marker_sphere_scale=marker_sphere_scale,
             )
         else:
             m = String()
@@ -749,6 +1081,9 @@ def main() -> None:
                 viz_substeps=viz_substeps,
                 viz_cap_hz=viz_cap_hz,
                 spatial_step_m=spatial_step_m,
+                marker_mesh_uri=marker_mesh_uri,
+                marker_mesh_scale=marker_mesh_scale,
+                marker_sphere_scale=marker_sphere_scale,
             )
     finally:
         node.destroy_node()

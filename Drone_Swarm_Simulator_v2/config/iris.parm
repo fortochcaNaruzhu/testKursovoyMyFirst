@@ -28,3 +28,17 @@ INS_GYR_CAL      0
 # По умолчанию: 4500 (45 градусов)
 # 1 градус = 100 сантиградусов, поэтому 5500 = 55 градусов
 # ANGLE_MAX        5500
+
+# === MAVLink streamrate fix (prevent fall-back to ~4 Hz) ===
+# Set POSITION stream rate (GLOBAL_POSITION_INT + LOCAL_POSITION_NED) for several channels.
+# In SITL/UDP setups, the exact SRx channel mapping can vary; setting SR0..SR3 covers typical cases.
+SR0_POSITION     50
+SR1_POSITION     50
+SR2_POSITION     50
+SR3_POSITION     50
+
+# Ignore legacy REQUEST_DATA_STREAM overrides (bit 12 = 4096) so a late client can't reset rates.
+SERIAL0_OPTIONS  4096
+SERIAL1_OPTIONS  4096
+SERIAL2_OPTIONS  4096
+SERIAL3_OPTIONS  4096

@@ -16,15 +16,22 @@ SPEED_MAX: float = 4.0
 class PlaybackState:
     """Thread-safe playback state: playing, current_index, speed."""
 
-    def __init__(self, num_steps: int, initial_speed: float = 1.0) -> None:
+    def __init__(
+        self,
+        num_steps: int,
+        initial_speed: float = 1.0,
+        *,
+        start_paused: bool = False,
+    ) -> None:
         """Initialize state.
 
         Args:
             num_steps: Total number of steps (len(steps)); index in [0, num_steps-1].
             initial_speed: Initial speed multiplier (clamped to SPEED_MIN..SPEED_MAX).
+            start_paused: If True, do not advance time until set_playing(True) (e.g. Space in replay).
         """
         self._lock = threading.Lock()
-        self._playing = False
+        self._playing = not bool(start_paused)
         self._current_index = 0
         self._num_steps = max(0, num_steps)
         self._speed = self._clamp_speed(initial_speed)

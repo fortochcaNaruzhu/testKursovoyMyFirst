@@ -137,6 +137,20 @@ class TestPlaybackStateAdvanceIndex(unittest.TestCase):
         self.assertEqual(index, 1)
 
 
+class TestPlaybackStateInitialPlaying(unittest.TestCase):
+    """Default: interactive replay should advance (playing True)."""
+
+    def test_default_start_playing(self) -> None:
+        state = PlaybackState(num_steps=5)
+        playing, _, _ = state.get_state()
+        self.assertTrue(playing)
+
+    def test_start_paused_is_not_playing(self) -> None:
+        state = PlaybackState(num_steps=5, start_paused=True)
+        playing, _, _ = state.get_state()
+        self.assertFalse(playing)
+
+
 class TestPlaybackStateGetState(unittest.TestCase):
     """Test get_state returns correct (playing, index, speed)."""
 
