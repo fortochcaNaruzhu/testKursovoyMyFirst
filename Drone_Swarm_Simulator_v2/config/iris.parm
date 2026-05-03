@@ -37,7 +37,9 @@ SR1_POSITION     50
 SR2_POSITION     50
 SR3_POSITION     50
 
-# Ignore legacy REQUEST_DATA_STREAM overrides (bit 12 = 4096) so a late client can't reset rates.
+# Bit 12 (4096) = OPTION_NOSTREAMOVERRIDE: ignore legacy MAVLink REQUEST_DATA_STREAM only.
+# It does NOT block MAV_CMD_SET_MESSAGE_INTERVAL (used by pymavlink / scripts). Remove duplicate
+# interval requests in scenarios and loggers so SR*_POSITION above is the single source of truth.
 SERIAL0_OPTIONS  4096
 SERIAL1_OPTIONS  4096
 SERIAL2_OPTIONS  4096

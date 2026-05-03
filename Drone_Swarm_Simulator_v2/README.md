@@ -158,3 +158,24 @@ python3 replay/replay_rviz2.py --experiment experiments/exp_test3 --rate 1.0 --r
 source /opt/ros/jazzy/setup.bash
 cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
 python3 replay/replay_rviz2.py --experiment experiments/2026-04-19_17-16-19 --rviz --interactive --timeline-ui
+
+
+запуск в test_logov / chek_mode
+Console 1
+
+cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+source ../drone_env/bin/activate
+
+python launch_simulation.py -s -c antena_logic -n 1 --duration 60 --no-sitl-console \
+  --experiment-dir /home/user/Kursov3/test_logov/chek_mode
+
+  Console 2 (запускать после коннекта с дроном)
+  cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+source ../drone_env/bin/activate
+
+OUTDIR=/home/user/Kursov3/test_logov/chek_mode/mavlink_raw_full
+mkdir -p "$OUTDIR"
+
+python3 /home/user/Kursov3/test_logov/mavlink_dump_all_txt.py \
+  --port 14751 --duration 60 \
+  --out "$OUTDIR/mavlink_all_port14751.jsonl"

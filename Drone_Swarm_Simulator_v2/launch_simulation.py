@@ -38,6 +38,12 @@ SIM_VEHICLE_PATH: str = os.path.join(APM_HOME, "Tools", "autotest", "sim_vehicle
 # MAVLink UDP `--out=` from sim_vehicle.py (must match start_sitl_* port math).
 SITL_BASE_UDP_PORT = 14551
 SITL_UDP_PORT_STEP = 10
+# Second UDP stream for passive tools (e.g. test_logov/mavlink_position_rate_logger.py).
+# Must not overlap scenario/controller ports: MAVLinkWorker binds the base ports; sharing one UDP
+# listener splits packets (SO_REUSEPORT) and breaks logging (few rows, stale STABILIZE heartbeat).
+SITL_UDP_LOGGER_TAP_OFFSET = 100
+# Third UDP stream for full/raw dumps (e.g. txt/tlog). Example: drone1 14551 → tap2 14751.
+SITL_UDP_LOGGER_TAP2_OFFSET = 200
 
 # Per-drone home: sim_vehicle.py uses -l/--custom-location (lat,lon,alt,heading). We use one base
 # and offset East by (drone_index * 2) m so that in a common NED frame drone 0 is at Y=0, 1 at Y=2, etc.
@@ -119,7 +125,8 @@ SCENARIO_MIN_DRONES: Dict[str, int] = {
     "linear_chain2": 4,
     "linear_chain3": 4,
     "antenna": 4,
-    "antena_logic": 4,
+    # Allow 1 drone for MAVLink/rate experiments; full “antenna” formation needs more agents.
+    "antena_logic": 1,
 }
 
 # Many parallel MAVProxy + ArduCopter SITL processes need more spacing; otherwise CPU / IO
@@ -276,6 +283,8 @@ def start_sitl_only(
     cwd = APM_HOME if os.path.isdir(APM_HOME) else proj_root
     for i in range(num_drones):
         udp_port = SITL_BASE_UDP_PORT + i * SITL_UDP_PORT_STEP
+        udp_tap = udp_port + SITL_UDP_LOGGER_TAP_OFFSET
+        udp_tap2 = udp_port + SITL_UDP_LOGGER_TAP2_OFFSET
         home_str = _sitl_home_for_drone(i)
         args = [
             sys.executable,
@@ -284,13 +293,22 @@ def start_sitl_only(
             f"--instance={i}",
             f"--sysid={i + 1}",
             f"--out=127.0.0.1:{udp_port}",
+            f"--out=127.0.0.1:{udp_tap}",
+            f"--out=127.0.0.1:{udp_tap2}",
             "-l", home_str,
         ]
         if sitl_console:
             args.append("--console")
         if extra_params:
             args.extend(extra_params)
-        logger.info("[SITL] instance=%s, UDP -> 127.0.0.1:%s, custom_location=%s", i, udp_port, home_str)
+        logger.info(
+            "[SITL] instance=%s, UDP -> 127.0.0.1:%s (scenario), tap 127.0.0.1:%s (loggers), tap2 127.0.0.1:%s (raw), location=%s",
+            i,
+            udp_port,
+            udp_tap,
+            udp_tap2,
+            home_str,
+        )
         proc = subprocess.Popen(args, cwd=cwd)
         processes.append(proc)
         if i < num_drones - 1 and inter_instance_delay_sec > 0:
@@ -329,6 +347,7 @@ def start_sitl_webots(
     for i in range(num_drones):
         tcp_port = BASE_TCP + i * 10
         udp_port = SITL_BASE_UDP_PORT + i * SITL_UDP_PORT_STEP
+        udp_tap = udp_port + SITL_UDP_LOGGER_TAP_OFFSET
         home_str = _sitl_home_for_drone(i)
         args = [
             sys.executable,
@@ -339,13 +358,21 @@ def start_sitl_webots(
             f"--sysid={i + 1}",
             f"--out=127.0.0.1:{tcp_port}",
             f"--out=127.0.0.1:{udp_port}",
+            f"--out=127.0.0.1:{udp_tap}",
             "-l", home_str,
         ]
         if sitl_console:
             args.append("--console")
         if extra:
             args.extend(extra)
-        logger.info("[SITL] instance=%s, TCP=%s, UDP=%s, custom_location=%s", i, tcp_port, udp_port, home_str)
+        logger.info(
+            "[SITL] instance=%s, TCP=%s, UDP=%s (scenario), tap=%s, location=%s",
+            i,
+            tcp_port,
+            udp_port,
+            udp_tap,
+            home_str,
+        )
         proc = subprocess.Popen(args, cwd=cwd)
         processes.append(proc)
         if i < num_drones - 1 and inter_instance_delay_sec > 0:

@@ -73,7 +73,11 @@ INIT_STEPS = [
     {"type": "sleep", "sec": 2.0},
     {"type": "takeoff"},
     {"type": "sleep", "sec": 3.0},
+    # POSHOLD needs horizontal position (requires_GPS + position_ok); a tight switch can fail
+    # silently because pymavlink does not wait for COMMAND_ACK — vehicle stays in GUIDED.
     {"type": "set_mode", "mode_id": 16},  # POSHOLD
+    {"type": "sleep", "sec": 1.0},
+    {"type": "set_mode", "mode_id": 16},  # POSHOLD retry
     {
         "type": "rc_override",
         "chan1": RC_NEUTRAL,
@@ -82,8 +86,8 @@ INIT_STEPS = [
         "chan4": RC_NEUTRAL,
     },
     {"type": "sleep", "sec": 0.3},
-    {"type": "request_position_stream", "hz": 30},
-    {"type": "sleep", "sec": 0.2},
+    # Position stream rate: use ArduPilot params only (e.g. SR*_POSITION in config/iris.parm).
+    # Do not send MAV_CMD_SET_MESSAGE_INTERVAL here — it fights other clients and masks .parm tuning.
 ]
 
 
@@ -363,7 +367,12 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     parser = argparse.ArgumentParser(description="antena_logic: nearest-neighbor vertical antenna (rc_override)")
-    parser.add_argument("--drones", type=int, default=4, help="Number of drones (>=2; recommended >=4)")
+    parser.add_argument(
+        "--drones",
+        type=int,
+        default=4,
+        help="Number of drones (>=1; multi-agent antenna logic needs several; use 1 for single-SITL tests).",
+    )
     parser.add_argument("--duration", type=float, default=0.0, help="Run duration (s); 0 = infinite")
     parser.add_argument("--heartbeat-timeout", type=float, default=12.0, help="Heartbeat timeout (s)")
     parser.add_argument("--exchange-hz", type=float, default=50.0, help="Accepted for launcher compatibility; ignored.")
