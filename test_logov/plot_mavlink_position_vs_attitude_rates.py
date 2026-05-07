@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Plot effective rates for LOCAL_POSITION_NED vs ATTITUDE from combined mavlink_msgs.csv.
+Plot effective rates for position telemetry (LOCAL_POSITION_NED or SIM_STATE) vs ATTITUDE from combined mavlink_msgs.csv.
 
 Input: CSV produced by mavlink_position_rate_logger.py with --include-attitude.
 Columns:
@@ -40,10 +40,11 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(p))[0]
 
-    # per-type series
-    t_rel_by: Dict[str, List[float]] = {"LOCAL_POSITION_NED": [], "ATTITUDE": []}
-    dt_wall_by: Dict[str, List[float]] = {"LOCAL_POSITION_NED": [], "ATTITUDE": []}
-    boot_by: Dict[str, List[int]] = {"LOCAL_POSITION_NED": [], "ATTITUDE": []}
+    # Roll LOCAL_POSITION_NED and SIM_STATE into one "POSITION" series vs ATTITUDE.
+    t_rel_by: Dict[str, List[float]] = {"POSITION": [], "ATTITUDE": []}
+    dt_wall_by: Dict[str, List[float]] = {"POSITION": [], "ATTITUDE": []}
+    boot_by: Dict[str, List[int]] = {"POSITION": [], "ATTITUDE": []}
+    _POS_TYPES = frozenset({"LOCAL_POSITION_NED", "SIM_STATE"})
 
     wall0 = None
     with open(p, "r", encoding="utf-8") as f:
@@ -53,12 +54,19 @@ def main() -> None:
             if wall0 is None:
                 wall0 = wt
             mtype = row["msg_type"]
-            if mtype not in t_rel_by:
+            if mtype in _POS_TYPES:
+                bucket = "POSITION"
+            elif mtype == "ATTITUDE":
+                bucket = "ATTITUDE"
+            else:
                 continue
-            t_rel_by[mtype].append(wt - wall0)
+            t_rel_by[bucket].append(wt - wall0)
             sdt = (row.get("dt_wall_type") or "").strip()
-            dt_wall_by[mtype].append(float(sdt) if sdt else float("nan"))
-            boot_by[mtype].append(int(row.get("time_boot_ms", "0") or 0))
+            dt_wall_by[bucket].append(float(sdt) if sdt else float("nan"))
+            try:
+                boot_by[bucket].append(int(float(row.get("time_boot_ms") or 0)))
+            except ValueError:
+                boot_by[bucket].append(0)
 
     # Plot dt_wall_type over time (receive)
     plt.figure(figsize=(12.5, 4.8))
@@ -100,7 +108,7 @@ def main() -> None:
 
     # Histograms of boot diffs (ms)
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.2), sharey=False)
-    for ax, mtype in zip(axes, ["LOCAL_POSITION_NED", "ATTITUDE"]):
+    for ax, mtype in zip(axes, ["POSITION", "ATTITUDE"]):
         c = boot_hist.get(mtype, Counter())
         common = c.most_common(20)
         xs = [str(k) for k, _ in common]

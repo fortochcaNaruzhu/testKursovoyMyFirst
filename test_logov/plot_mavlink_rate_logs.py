@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Plot evidence graphs for MAVLink LOCAL_POSITION_NED arrival timing.
+Plot evidence graphs for MAVLink position telemetry arrival timing (LOCAL_POSITION_NED or SIM_STATE).
 
 Input CSV format produced by mavlink_position_rate_logger.py:
-  wall_time, dt_wall, time_boot_ms, x, y, z, vx, vy, vz
+  wall_time, dt_wall_any / dt_wall_type, time_boot_ms, msg_type, …
 
 Outputs PNG files next to the CSV (or in --out-dir).
 """
@@ -25,11 +25,19 @@ def _read_csv(path: str) -> Tuple[List[float], List[float], List[int]]:
     boot: List[int] = []
     with open(path, "r", encoding="utf-8") as f:
         r = csv.DictReader(f)
+        fields = r.fieldnames or ()
+        has_msg_type = "msg_type" in fields
         for row in r:
+            if has_msg_type:
+                mt = (row.get("msg_type") or "").strip()
+                if mt and mt not in ("LOCAL_POSITION_NED", "SIM_STATE"):
+                    continue
             wall.append(float(row["wall_time"]))
-            b = int(row.get("time_boot_ms", "0") or 0)
-            boot.append(b)
-            sdt = (row.get("dt_wall") or "").strip()
+            try:
+                boot.append(int(float(row.get("time_boot_ms") or 0)))
+            except ValueError:
+                boot.append(0)
+            sdt = (row.get("dt_wall") or row.get("dt_wall_any") or "").strip()
             if sdt:
                 try:
                     dt.append(float(sdt))
@@ -50,7 +58,7 @@ def _quantiles(xs: List[float], ps=(0.5, 0.9, 0.95, 0.99)) -> dict:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Plot MAVLink LOCAL_POSITION_NED arrival timing graphs.")
+    ap = argparse.ArgumentParser(description="Plot MAVLink position telemetry arrival timing graphs.")
     ap.add_argument(
         "csv",
         nargs="?",
@@ -148,7 +156,7 @@ def main() -> None:
     plt.grid(True, alpha=0.35)
     plt.xlabel("t_rel (s)")
     plt.ylabel("cumulative messages")
-    plt.title(f"{stem}: cumulative LOCAL_POSITION_NED messages (flat slope = stalls)")
+    plt.title(f"{stem}: cumulative position messages (flat slope = stalls)")
     p4 = os.path.join(out_dir, f"{stem}__cumulative_messages.png")
     plt.tight_layout()
     plt.savefig(p4, dpi=160)

@@ -176,6 +176,9 @@ def _rows_to_marker_array(
     mesh_resource_uri: Optional[str] = None,
     mesh_scale: float = 1.0,
     sphere_scale: float = 0.45,
+    ground: bool = False,
+    ground_size_m: float = 200.0,
+    ground_z_m: float = 0.0,
 ) -> MarkerArray:
     """Build MarkerArray for RViz2: optional Collada mesh (e.g. iris.dae) or colored spheres."""
     out = MarkerArray()
@@ -185,6 +188,29 @@ def _rows_to_marker_array(
     ms = float(mesh_scale)
     if ms <= 0:
         ms = 1.0
+    if ground:
+        s = max(1.0, float(ground_size_m))
+        z0 = float(ground_z_m)
+        gm = Marker()
+        gm.header.frame_id = frame_id
+        gm.header.stamp = stamp
+        gm.ns = "environment"
+        gm.id = 0
+        gm.action = Marker.ADD
+        gm.type = Marker.CUBE
+        gm.pose.position.x = 0.0
+        gm.pose.position.y = 0.0
+        # Put the top face exactly at z0 (ENU up).
+        gm.pose.position.z = z0 - 0.01
+        gm.pose.orientation.w = 1.0
+        gm.scale.x = s
+        gm.scale.y = s
+        gm.scale.z = 0.02
+        # "Grass" color.
+        gm.color = ColorRGBA(r=0.20, g=0.60, b=0.20, a=1.0)
+        gm.lifetime.sec = 0
+        gm.lifetime.nanosec = 0
+        out.markers.append(gm)
     for i, row in enumerate(step_list):
         if row is None:
             continue
@@ -293,6 +319,9 @@ def _publish_step_poses_and_markers(
     marker_mesh_uri: Optional[str] = None,
     marker_mesh_scale: float = 1.0,
     marker_sphere_scale: float = 0.45,
+    ground: bool = False,
+    ground_size_m: float = 200.0,
+    ground_z_m: float = 0.0,
 ) -> None:
     for i, row in enumerate(step_list):
         if row is None:
@@ -308,6 +337,9 @@ def _publish_step_poses_and_markers(
                 mesh_resource_uri=marker_mesh_uri,
                 mesh_scale=marker_mesh_scale,
                 sphere_scale=marker_sphere_scale,
+                ground=ground,
+                ground_size_m=ground_size_m,
+                ground_z_m=ground_z_m,
             )
         )
 
@@ -482,7 +514,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--interactive",
         action="store_true",
-        help="Play/pause, seek, speed via keyboard and /replay/* topics.",
+        default=True,
+        help=(
+            "Интерактивный режим (по умолчанию включён): play/pause, seek, speed через клавиатуру и /replay/* topics. "
+            "Чтобы выключить: --no-interactive."
+        ),
+    )
+    p.add_argument(
+        "--no-interactive",
+        action="store_false",
+        dest="interactive",
+        help="Выключить интерактивный режим (линейное воспроизведение без управления).",
     )
     p.add_argument(
         "--start-paused",
@@ -492,7 +534,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--timeline-ui",
         action="store_true",
+        default=True,
         help="Только с --interactive: открыть локальное окно с таймлайном (ползунок) и кнопками Play/Pause.",
+    )
+    p.add_argument(
+        "--no-timeline-ui",
+        action="store_false",
+        dest="timeline_ui",
+        help="Выключить локальное окно таймлайна (ползунок).",
     )
     p.add_argument(
         "--frame-id",
@@ -535,6 +584,32 @@ def _parse_args() -> argparse.Namespace:
         help="Диаметр/масштаб сферы при --marker-spheres (метры).",
     )
     p.add_argument(
+        "--ground",
+        action="store_true",
+        default=True,
+        help="Добавить плоскость-«землю» (зелёный тонкий куб) в /swarm/markers (по умолчанию включено).",
+    )
+    p.add_argument(
+        "--no-ground",
+        action="store_false",
+        dest="ground",
+        help="Выключить плоскость-«землю».",
+    )
+    p.add_argument(
+        "--ground-size",
+        type=float,
+        default=50.0,
+        metavar="M",
+        help="Размер стороны «земли» (метры). По умолчанию 50.",
+    )
+    p.add_argument(
+        "--ground-z",
+        type=float,
+        default=0.0,
+        metavar="Z",
+        help="Высота плоскости «земли» в ENU (метры). По умолчанию 0.",
+    )
+    p.add_argument(
         "--rviz",
         action="store_true",
         help="Запустить RViz2 с replay/rviz2_swarm_replay.rviz (сетка + MarkerArray /swarm/markers, Fixed Frame world).",
@@ -543,7 +618,10 @@ def _parse_args() -> argparse.Namespace:
         "--rviz-config",
         type=str,
         default="",
-        help="Путь к .rviz (по умолчанию: replay/rviz2_swarm_replay.rviz рядом со скриптом).",
+        help=(
+            "Путь к .rviz. По умолчанию: replay/rviz2_swarm_replay_sky.rviz (если есть), "
+            "иначе replay/rviz2_swarm_replay.rviz рядом со скриптом."
+        ),
     )
     p.add_argument(
         "--viz-substeps",
@@ -702,6 +780,9 @@ def _run_linear(
     marker_mesh_uri: Optional[str] = None,
     marker_mesh_scale: float = 1.0,
     marker_sphere_scale: float = 0.45,
+    ground: bool = False,
+    ground_size_m: float = 200.0,
+    ground_z_m: float = 0.0,
 ) -> None:
     nseg = max(1, int(viz_substeps))
     use_interp = nseg > 1 or spatial_step_m > 0
@@ -720,6 +801,9 @@ def _run_linear(
                 marker_mesh_uri=marker_mesh_uri,
                 marker_mesh_scale=marker_mesh_scale,
                 marker_sphere_scale=marker_sphere_scale,
+                ground=ground,
+                ground_size_m=ground_size_m,
+                ground_z_m=ground_z_m,
             )
             dt = t - prev_t
             prev_t = t
@@ -741,6 +825,9 @@ def _run_linear(
         marker_mesh_uri=marker_mesh_uri,
         marker_mesh_scale=marker_mesh_scale,
         marker_sphere_scale=marker_sphere_scale,
+        ground=ground,
+        ground_size_m=ground_size_m,
+        ground_z_m=ground_z_m,
     )
     rclpy.spin_once(node, timeout_sec=0.0)
     for i in range(len(steps) - 1):
@@ -765,6 +852,9 @@ def _run_linear(
                 marker_mesh_uri=marker_mesh_uri,
                 marker_mesh_scale=marker_mesh_scale,
                 marker_sphere_scale=marker_sphere_scale,
+                ground=ground,
+                ground_size_m=ground_size_m,
+                ground_z_m=ground_z_m,
             )
             if rate > 0:
                 time.sleep(dt / seg / rate)
@@ -795,6 +885,9 @@ def _run_interactive(
     marker_mesh_uri: Optional[str] = None,
     marker_mesh_scale: float = 1.0,
     marker_sphere_scale: float = 0.45,
+    ground: bool = False,
+    ground_size_m: float = 200.0,
+    ground_z_m: float = 0.0,
 ) -> None:
     step_times = [s[0] for s in steps]
     n = len(steps)
@@ -856,6 +949,9 @@ def _run_interactive(
                     marker_mesh_uri=marker_mesh_uri,
                     marker_mesh_scale=marker_mesh_scale,
                     marker_sphere_scale=marker_sphere_scale,
+                    ground=ground,
+                    ground_size_m=ground_size_m,
+                    ground_z_m=ground_z_m,
                 )
                 if speed > 0:
                     time.sleep(dt / seg / speed)
@@ -872,6 +968,9 @@ def _run_interactive(
                 marker_mesh_uri=marker_mesh_uri,
                 marker_mesh_scale=marker_mesh_scale,
                 marker_sphere_scale=marker_sphere_scale,
+                ground=ground,
+                ground_size_m=ground_size_m,
+                ground_z_m=ground_z_m,
             )
             if playing and idx < n - 1:
                 next_t = steps[idx + 1][0]
@@ -922,6 +1021,9 @@ def main() -> None:
 
     marker_sphere_scale = max(0.01, float(args.marker_sphere_scale))
     marker_mesh_scale = max(0.01, float(args.marker_mesh_scale))
+    ground_enabled = bool(getattr(args, "ground", False))
+    ground_size_m = float(getattr(args, "ground_size", 200.0))
+    ground_z_m = float(getattr(args, "ground_z", 0.0))
     marker_mesh_uri: Optional[str] = None
     if args.marker_spheres:
         logger.info("Маркеры RViz: сферы (масштаб %.3f м).", marker_sphere_scale)
@@ -963,7 +1065,10 @@ def main() -> None:
     if publish_markers:
         markers_pub = node.create_publisher(MarkerArray, "/swarm/markers", qos)
 
-    rviz_config = args.rviz_config or os.path.join(_script_dir, "rviz2_swarm_replay.rviz")
+    default_rviz_config = os.path.join(_script_dir, "rviz2_swarm_replay_sky.rviz")
+    if not os.path.isfile(default_rviz_config):
+        default_rviz_config = os.path.join(_script_dir, "rviz2_swarm_replay.rviz")
+    rviz_config = args.rviz_config or default_rviz_config
     if args.rviz:
         if args.frame_id != "world":
             logger.warning(
@@ -1061,6 +1166,9 @@ def main() -> None:
                 marker_mesh_uri=marker_mesh_uri,
                 marker_mesh_scale=marker_mesh_scale,
                 marker_sphere_scale=marker_sphere_scale,
+                ground=ground_enabled,
+                ground_size_m=ground_size_m,
+                ground_z_m=ground_z_m,
             )
         else:
             m = String()
@@ -1084,6 +1192,9 @@ def main() -> None:
                 marker_mesh_uri=marker_mesh_uri,
                 marker_mesh_scale=marker_mesh_scale,
                 marker_sphere_scale=marker_sphere_scale,
+                ground=ground_enabled,
+                ground_size_m=ground_size_m,
+                ground_z_m=ground_z_m,
             )
     finally:
         node.destroy_node()

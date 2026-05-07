@@ -148,7 +148,7 @@ def initialize_drone_antenna(
                 break
             time.sleep(0.1)
         else:
-            raise TimeoutError("No LOCAL_POSITION_NED after initialization")
+            raise TimeoutError("No SIM_STATE position after initialization")
 
         init_barrier.wait(timeout=float(barrier_timeout_sec))
     except Exception:

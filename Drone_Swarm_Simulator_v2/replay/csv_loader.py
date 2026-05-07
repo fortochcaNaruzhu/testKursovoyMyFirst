@@ -10,8 +10,25 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 
 # --- T1: Validation constants ---
 REQUIRED_METADATA_KEYS = ("duration_sec", "collision_radius_m", "num_drones", "scenario")
-CSV_HEADER = "t,x,y,z,rx,ry,rz,hasCollision"
-EXPECTED_COLUMNS = 8
+CSV_HEADER_LEGACY = "t,x,y,z,rx,ry,rz,hasCollision"
+CSV_HEADER = "t,x,y,z,rx,ry,rz,hasCollision,sitl_time_boot_s"
+CSV_HEADER_ANTENA_TELEMETRY = (
+    CSV_HEADER + ",sigma_x,sigma_y,sigma_z,rc_roll,rc_pitch,rc_throttle,rc_yaw,vx,vy,vz"
+)
+
+
+def _expected_columns_from_header(header: str) -> int:
+    h = header.strip()
+    if h == CSV_HEADER:
+        return 9
+    if h == CSV_HEADER_LEGACY:
+        return 8
+    if h == CSV_HEADER_ANTENA_TELEMETRY:
+        return 19
+    raise ValueError(
+        f"invalid CSV header (expected '{CSV_HEADER_LEGACY}', '{CSV_HEADER}', "
+        f"or '{CSV_HEADER_ANTENA_TELEMETRY}', got '{h}')"
+    )
 
 
 def _validate_metadata(metadata: Dict[str, Any]) -> None:
@@ -48,18 +65,15 @@ def _validate_csv(path: str) -> None:
             header = first.strip()
         else:
             header = first.strip()
-        if header != CSV_HEADER:
-            raise ValueError(
-                f"CSV {path}: invalid header (expected '{CSV_HEADER}', got '{header}')"
-            )
+        expected = _expected_columns_from_header(header)
         for i, line in enumerate(f, start=2):
             line = line.strip()
             if not line:
                 continue
             parts = line.split(",")
-            if len(parts) != EXPECTED_COLUMNS:
+            if len(parts) != expected:
                 raise ValueError(
-                    f"CSV {path} line {i}: expected {EXPECTED_COLUMNS} columns, got {len(parts)}"
+                    f"CSV {path} line {i}: expected {expected} columns, got {len(parts)}"
                 )
 
 
@@ -68,8 +82,7 @@ def load_experiment(experiment_dir: str) -> Dict[str, Any]:
 
     Expects experiment_dir to contain:
       - metadata.json with keys: duration_sec, collision_radius_m, num_drones, scenario
-      - drone_1.csv, drone_2.csv, ... with header t,x,y,z,rx,ry,rz,hasCollision
-        and exactly 8 columns per row.
+      - drone_1.csv, drone_2.csv, ... with header legacy (8 cols) or extended (9 cols with sitl).
 
     Args:
         experiment_dir: Path to the experiment directory.
@@ -108,21 +121,41 @@ def load_experiment(experiment_dir: str) -> Dict[str, Any]:
     }
 
 
-def _parse_row(line: str) -> Dict[str, Any]:
-    """Parse one CSV data row into a dict with t,x,y,z,rx,ry,rz,hasCollision."""
-    parts = line.strip().split(",")
-    if len(parts) != EXPECTED_COLUMNS:
-        raise ValueError(f"Row has {len(parts)} columns, expected {EXPECTED_COLUMNS}")
-    return {
-        "t": float(parts[0]),
-        "x": float(parts[1]),
-        "y": float(parts[2]),
-        "z": float(parts[3]),
-        "rx": float(parts[4]),
-        "ry": float(parts[5]),
-        "rz": float(parts[6]),
-        "hasCollision": int(parts[7]),
-    }
+def _parse_parts(parts: List[str]) -> Dict[str, Any]:
+    """Parse CSV columns into row dict (8, 9, or 19 columns)."""
+    n = len(parts)
+    if n == 8:
+        return {
+            "t": float(parts[0]),
+            "x": float(parts[1]),
+            "y": float(parts[2]),
+            "z": float(parts[3]),
+            "rx": float(parts[4]),
+            "ry": float(parts[5]),
+            "rz": float(parts[6]),
+            "hasCollision": int(parts[7]),
+        }
+    if n == 9:
+        row = _parse_parts(parts[:8])
+        raw_sitl = parts[8].strip()
+        row["sitl_time_boot_s"] = (
+            float(raw_sitl) if raw_sitl != "" else None
+        )
+        return row
+    if n == 19:
+        row = _parse_parts(parts[:9])
+        row["sigma_x"] = float(parts[9])
+        row["sigma_y"] = float(parts[10])
+        row["sigma_z"] = float(parts[11])
+        row["rc_roll"] = int(float(parts[12]))
+        row["rc_pitch"] = int(float(parts[13]))
+        row["rc_throttle"] = int(float(parts[14]))
+        row["rc_yaw"] = int(float(parts[15]))
+        row["vx"] = float(parts[16])
+        row["vy"] = float(parts[17])
+        row["vz"] = float(parts[18])
+        return row
+    raise ValueError(f"Row has {n} columns, expected 8, 9, or 19")
 
 
 def _read_drone_csv(path: str) -> List[Dict[str, Any]]:
@@ -130,13 +163,17 @@ def _read_drone_csv(path: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as f:
         header = f.readline().strip()
-        if header != CSV_HEADER:
-            raise ValueError(f"Invalid header in {path}: expected '{CSV_HEADER}'")
+        expected = _expected_columns_from_header(header)
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            rows.append(_parse_row(line))
+            parts = line.split(",")
+            if len(parts) != expected:
+                raise ValueError(
+                    f"{path}: expected {expected} columns, got {len(parts)}"
+                )
+            rows.append(_parse_parts(parts))
     return rows
 
 
@@ -156,7 +193,7 @@ def iter_steps(
     """Step-wise iteration over experiment data.
 
     For each time step yields (t, list_of_drone_dicts). Each dict has keys
-    t, x, y, z, rx, ry, rz, hasCollision. List length equals num_drones;
+    t, x, y, z, rx, ry, rz, hasCollision (optional sitl_time_boot_s). List length equals num_drones;
     list[i] is the row for drone i+1 at this t, or None if that drone has
     no row for this timestamp.
 

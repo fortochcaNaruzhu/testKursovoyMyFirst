@@ -10,7 +10,7 @@
 Управление: RC override. Внутренние: закон Anatoliy (tanh по квадрантам, v=0 в SITL) +
 пропорциональные стики; геометрия в common NED как +e_along*u и −e_cross*n.
 
-Важно: pitch/roll — в плоскости корпуса, comb — в NED. Перед стиками: поворот по yaw из ATTITUDE.
+Важно: pitch/roll — в плоскости корпуса, comb — в NED. Перед стиками: поворот по yaw из телеметрии (SIM_STATE → worker.get_attitude).
 Если по графику едет только North, а East «мёртвый» — проверь YAW_SIGN (часто в SITL нужен −1)
 и RC_OVERRIDE_SWAP_ROLL_PITCH под свою RCMAP.
 """
@@ -82,7 +82,7 @@ SPACING_E_ALONG_CLAMP_M = 2.2
 SPACING_E_CROSS_CLAMP_M = 2.2
 SPACING_E_DEADBAND_M = 0.065
 
-# Знак yaw из ATTITUDE относительно NED (множитель на rz). −1 часто совпадает с SITL ArduPilot.
+# Знак yaw из телеметрии относительно NED (множитель на rz). −1 часто совпадает с SITL ArduPilot.
 YAW_SIGN = -1.0
 # Усиление канала roll (East при носе на север): POS_HOLD часто слабее реагирует на крен.
 INTERNAL_RC_KP_ROLL_MULT = 1.22
@@ -132,7 +132,7 @@ def _clamp_rc(pwm: int, lo: int = 1100, hi: int = 1900) -> int:
 
 
 def _yaw_rad(controller: DroneController) -> float:
-    """Рыскание из ATTITUDE (rad), с учётом YAW_SIGN."""
+    """Рыскание из worker attitude / SIM_STATE (rad), с учётом YAW_SIGN."""
     cm = getattr(controller, "coords_monitor", None)
     if cm is None:
         return 0.0

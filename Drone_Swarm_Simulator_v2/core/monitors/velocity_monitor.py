@@ -1,7 +1,7 @@
 """
 Monitors drone velocity (vx, vy, vz) from MAVLinkWorker state.
 
-Velocity is taken from LOCAL_POSITION_NED (vx, vy, vz) cached in the worker.
+Velocity is taken from SIM_STATE (vn/ve/vd as vx, vy, vz) cached in the worker.
 No dedicated thread: reads from the worker's thread-safe state.
 """
 
@@ -20,7 +20,7 @@ class VelocityMonitor:
     Returns NED velocity (vx, vy, vz) from the MAVLinkWorker position cache.
 
     Does not own any MAVLink connection or threads. The worker's single thread
-    updates position (including vx, vy, vz from LOCAL_POSITION_NED).
+    updates position (including vx, vy, vz from SIM_STATE).
     """
 
     def __init__(self, worker: MAVLinkWorker) -> None:

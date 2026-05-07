@@ -59,13 +59,13 @@ def initialize_drone_solo(
     controller.initialize(list(init_steps))
     controller.start_rc_keepalive()
 
-    # Ensure we actually receive LOCAL_POSITION_NED after requesting the stream.
+    # Ensure we actually receive SIM_STATE-derived position after requesting the stream.
     t0 = time.time()
     while time.time() - t0 < float(position_timeout_s):
         if controller.get_position() is not None:
             return
         time.sleep(0.1)
-    raise TimeoutError("No LOCAL_POSITION_NED received after initialization")
+    raise TimeoutError("No SIM_STATE position received after initialization")
 
 
 def _wait_for_takeoff(
@@ -75,7 +75,7 @@ def _wait_for_takeoff(
     tol_m: float = 0.30,
 ) -> bool:
     """
-    Wait until LOCAL_POSITION_NED indicates altitude ~ target_alt_m.
+    Wait until SIM_STATE-derived altitude ~ target_alt_m.
 
     In NED, z is positive down, so up is negative.
     """

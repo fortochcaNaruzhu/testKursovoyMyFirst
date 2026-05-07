@@ -1,5 +1,5 @@
 """
-CSV and metadata logging for experiments: per-drone CSV (t,x,y,z,rx,ry,rz,hasCollision)
+CSV and metadata logging for experiments: per-drone CSV incl. optional sitl_time_boot_s.
 and metadata.json.
 """
 
@@ -10,7 +10,12 @@ from typing import Any, Dict, Optional, TextIO
 
 logger = logging.getLogger(__name__)
 
-CSV_HEADER = "t,x,y,z,rx,ry,rz,hasCollision"
+CSV_HEADER = "t,x,y,z,rx,ry,rz,hasCollision,sitl_time_boot_s"
+
+# Optional trailing columns for antena_logic (copy): σ-like scalars, RC PWM, NED velocity.
+CSV_HEADER_ANTENA_TELEMETRY = (
+    CSV_HEADER + ",sigma_x,sigma_y,sigma_z,rc_roll,rc_pitch,rc_throttle,rc_yaw,vx,vy,vz"
+)
 
 
 def write_row(
@@ -24,6 +29,7 @@ def write_row(
     ry: float,
     rz: float,
     has_collision: int,
+    sitl_time_boot_s: Optional[float] = None,
 ) -> None:
     """
     Append one CSV row for a drone (one time step).
@@ -35,8 +41,50 @@ def write_row(
         x, y, z: NED position (m).
         rx, ry, rz: Euler angles roll, pitch, yaw (radians).
         has_collision: 0 or 1.
+        sitl_time_boot_s: SITL/autopilot time_boot from last pose message (s); omit or None → -1.
     """
-    line = f"{t:.6f},{x:.6f},{y:.6f},{z:.6f},{rx:.6f},{ry:.6f},{rz:.6f},{has_collision}\n"
+    sitl_col = f"{float(sitl_time_boot_s):.6f}" if sitl_time_boot_s is not None else "-1.000000"
+    line = (
+        f"{t:.6f},{x:.6f},{y:.6f},{z:.6f},{rx:.6f},{ry:.6f},{rz:.6f},"
+        f"{has_collision},{sitl_col}\n"
+    )
+    file_handle.write(line)
+    file_handle.flush()
+
+
+def write_row_antena_telemetry(
+    file_handle: TextIO,
+    drone_id: int,
+    t: float,
+    x: float,
+    y: float,
+    z: float,
+    rx: float,
+    ry: float,
+    rz: float,
+    has_collision: int,
+    sitl_time_boot_s: Optional[float],
+    *,
+    sigma_x: float,
+    sigma_y: float,
+    sigma_z: float,
+    rc_roll: int,
+    rc_pitch: int,
+    rc_throttle: int,
+    rc_yaw: int,
+    vx: float,
+    vy: float,
+    vz: float,
+) -> None:
+    """Append one CSV row including horizontal/vertical law scalars, RC override PWM, NED velocity."""
+    sitl_col = f"{float(sitl_time_boot_s):.6f}" if sitl_time_boot_s is not None else "-1.000000"
+    line = (
+        f"{t:.6f},{x:.6f},{y:.6f},{z:.6f},{rx:.6f},{ry:.6f},{rz:.6f},"
+        f"{has_collision},{sitl_col},"
+        f"{sigma_x:.6f},{sigma_y:.6f},{sigma_z:.6f},"
+        f"{int(rc_roll)},{int(rc_pitch)},{int(rc_throttle)},{int(rc_yaw)},"
+        f"{vx:.6f},{vy:.6f},{vz:.6f}\n"
+    )
     file_handle.write(line)
     file_handle.flush()
 
@@ -78,7 +126,7 @@ class CSVLogger:
     """
     Helper to manage per-drone CSV files and optional metadata.
 
-    Open one file per drone with header "t,x,y,z,rx,ry,rz,hasCollision";
+    Open one file per drone with header matching CSV_HEADER (incl. sitl_time_boot_s);
     write_row adds one line per step. Call write_metadata once for the run.
     """
 
@@ -115,6 +163,7 @@ class CSVLogger:
         ry: float,
         rz: float,
         has_collision: int,
+        sitl_time_boot_s: Optional[float] = None,
     ) -> None:
         """Append one row for the given drone.
 
@@ -126,6 +175,7 @@ class CSVLogger:
             x, y, z: NED position (m).
             rx, ry, rz: Euler angles roll, pitch, yaw (radians).
             has_collision: 0 or 1.
+            sitl_time_boot_s: SITL time_boot for pose sample (s), optional.
         """
         if drone_id not in self._files:
             return
@@ -140,6 +190,7 @@ class CSVLogger:
             ry,
             rz,
             has_collision,
+            sitl_time_boot_s=sitl_time_boot_s,
         )
 
     def close_all(self) -> None:

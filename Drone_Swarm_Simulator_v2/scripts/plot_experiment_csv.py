@@ -40,7 +40,7 @@ def load_drone_csv(path: str) -> np.ndarray:
             if not line:
                 continue
             parts = line.split(",")
-            if len(parts) != 8:
+            if len(parts) not in (8, 9):
                 continue
             row = [float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]),
                    float(parts[4]), float(parts[5]), float(parts[6]), int(parts[7])]

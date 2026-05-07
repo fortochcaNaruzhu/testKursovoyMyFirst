@@ -88,6 +88,18 @@ SCENARIOS: List[Tuple[str, str, str, str]] = [
         project_root,
     ),
     (
+        "antena_logic_copy",
+        "Antena logic (copy, XY 1max): vertical antenna + neighbor XY",
+        "scenarios/antena_logic copy.py",
+        project_root,
+    ),
+    (
+        "fntena_logic_copy2",
+        "Fntena logic (copy2, grid_antenna-like): bang-bang σ on x/y/z",
+        "scenarios/fntena_logic_copy2.py",
+        project_root,
+    ),
+    (
         "leader_forward_back",
         "Leader forward-back (leader_forward_back)",
         "scenarios/leader_forward_back.py",
@@ -127,6 +139,8 @@ SCENARIO_MIN_DRONES: Dict[str, int] = {
     "antenna": 4,
     # Allow 1 drone for MAVLink/rate experiments; full “antenna” formation needs more agents.
     "antena_logic": 1,
+    "antena_logic_copy": 1,
+    "fntena_logic_copy2": 1,
 }
 
 # Many parallel MAVProxy + ArduCopter SITL processes need more spacing; otherwise CPU / IO
@@ -556,7 +570,7 @@ Examples:
         choices=["timer", "mavlink"],
         help=(
             "Scenario-specific: CSV logging mode. Currently forwarded only to "
-            "scenario 'antena_logic' as --log-mode."
+            "scenarios 'antena_logic' and 'antena_logic_copy' as --log-mode."
         ),
     )
     parser.add_argument(
@@ -758,7 +772,7 @@ Examples:
     if exchange_hz > 0:
         scenario_cmd.extend(["--exchange-hz", str(exchange_hz)])
     # Forward scenario-specific args only when supported by that scenario.
-    if scenario_id == "antena_logic" and getattr(args, "log_mode", None):
+    if scenario_id in ("antena_logic", "antena_logic_copy") and getattr(args, "log_mode", None):
         scenario_cmd.extend(["--log-mode", str(args.log_mode)])
     scenario_proc = subprocess.Popen(
         scenario_cmd,

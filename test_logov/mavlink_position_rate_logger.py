@@ -9,9 +9,14 @@ IMPORTANT (Drone_Swarm_Simulator_v2): use the logger ``tap`` UDP ports, not the 
 The launcher duplicates ``--out`` as base port (MAVLinkWorker) and base+100 (passive loggers).
 Example: drone 1 → scenario 14551, logger 14651; drone 2 → 14561 / 14661; etc.
 
-When --include-attitude
-is enabled, both LOCAL_POSITION_NED and ATTITUDE are logged (interleaved) with a
-msg_type column and per-type dt columns:
+Default telemetry matches the simulator: SIM_STATE (pose + attitude + vn/ve/vd), with
+HOME_POSITION latched for NED x,y,z columns (same convention as ``core/mavlink/worker.py``).
+
+With --include-attitude, ATTITUDE messages are also logged (interleaved) for comparison.
+
+Use --legacy-local-ned to log LOCAL_POSITION_NED instead (older CSV/plot workflows).
+
+CSV columns:
   wall_time, msg_type, dt_wall_any, dt_wall_type, time_boot_ms,
   mode, custom_mode, base_mode, hb_sysid, hb_compid,
   x,y,z,vx,vy,vz, roll,pitch,yaw
@@ -24,10 +29,30 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import sys
 import time
 from typing import Any, Dict, Optional, Tuple
 
 from pymavlink import mavutil
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_SIM_PKG = os.path.join(_REPO_ROOT, "Drone_Swarm_Simulator_v2")
+if _SIM_PKG not in sys.path:
+    sys.path.insert(0, _SIM_PKG)
+
+from core.mavlink.geo_ned import (  # noqa: E402
+    home_position_lat_lon_alt_m,
+    ned_metres_from_home,
+    sim_state_lat_lon_deg,
+)
+
+
+def _sim_state_msg_id() -> int:
+    return int(getattr(mavutil.mavlink, "MAVLINK_MSG_ID_SIM_STATE", 108))
+
+
+def _home_position_msg_id() -> int:
+    return int(getattr(mavutil.mavlink, "MAVLINK_MSG_ID_HOME_POSITION", 242))
 
 
 def _hb_sys_comp(msg: Any) -> Tuple[int, int]:
@@ -41,11 +66,10 @@ def _hb_sys_comp(msg: Any) -> Tuple[int, int]:
         return (0, 0)
 
 
-def _request_interval(master: any, msg_id: int, hz: float) -> None:
-    # MAV_CMD_SET_MESSAGE_INTERVAL uses microseconds between messages.
+def _request_interval(master: Any, msg_id: int, hz: float) -> None:
     if hz <= 0:
         return
-    interval_us = int(1e6 / float(hz))
+    interval_us = max(1, int(1e6 / float(hz)))
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
@@ -62,10 +86,6 @@ def _request_interval(master: any, msg_id: int, hz: float) -> None:
 
 
 def _mode_string(master: Any, hb_msg: Any) -> str:
-    """
-    Best-effort mode string for ArduPilot.
-    Uses pymavlink helpers; falls back to custom_mode integer.
-    """
     try:
         s = mavutil.mode_string_v10(hb_msg)
         if s:
@@ -73,7 +93,6 @@ def _mode_string(master: Any, hb_msg: Any) -> str:
     except Exception:
         pass
     try:
-        # master.mode_mapping() may exist, but mapping can be incomplete depending on dialect.
         cm = int(getattr(hb_msg, "custom_mode", -1))
         return f"custom_mode_{cm}"
     except Exception:
@@ -89,15 +108,22 @@ def main() -> None:
         type=float,
         default=0.0,
         help=(
-            "If >0, send MAV_CMD_SET_MESSAGE_INTERVAL for LOCAL_POSITION_NED at this Hz. "
-            "Default 0 = do not send; use ArduPilot stream params only (e.g. SR*_POSITION in iris.parm)."
+            "If >0, send MAV_CMD_SET_MESSAGE_INTERVAL: SIM_STATE at this Hz (default mode), "
+            "plus HOME_POSITION at 2 Hz for NED origin. "
+            "With --legacy-local-ned, requests LOCAL_POSITION_NED instead. "
+            "Default 0 = do not send; use ArduPilot stream params only."
         ),
     )
     ap.add_argument("--att-hz", type=float, default=0.0, help="Optional ATTITUDE requested rate (Hz).")
     ap.add_argument(
         "--include-attitude",
         action="store_true",
-        help="Log both LOCAL_POSITION_NED and ATTITUDE (interleaved) into one CSV.",
+        help="Also log ATTITUDE messages (interleaved) into one CSV.",
+    )
+    ap.add_argument(
+        "--legacy-local-ned",
+        action="store_true",
+        help="Use LOCAL_POSITION_NED instead of SIM_STATE (matches pre–SIM_STATE tooling).",
     )
     ap.add_argument(
         "--include-heartbeat",
@@ -111,7 +137,7 @@ def main() -> None:
         "--out",
         type=str,
         default="test_logov/mavlink_msgs.csv",
-        help="Output CSV path (default test_logov/mavlink_local_position_ned.csv).",
+        help="Output CSV path (default test_logov/mavlink_msgs.csv).",
     )
     ap.add_argument("--heartbeat-timeout", type=float, default=10.0, help="Seconds to wait for heartbeat.")
     ap.add_argument(
@@ -133,15 +159,20 @@ def main() -> None:
 
     vehicle_sysid = int(hb.get_srcSystem())
 
-    # Ensure command_long_send targets this autopilot (FC sysid from first vehicle heartbeat).
     try:
         master.target_system = vehicle_sysid
         master.target_component = int(hb.get_srcComponent() or 1)
     except Exception:
         pass
 
+    legacy = bool(args.legacy_local_ned)
+
     if float(args.hz) > 0:
-        _request_interval(master, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, float(args.hz))
+        if legacy:
+            _request_interval(master, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, float(args.hz))
+        else:
+            _request_interval(master, _home_position_msg_id(), 2.0)
+            _request_interval(master, _sim_state_msg_id(), float(args.hz))
     if float(args.att_hz) > 0:
         _request_interval(master, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, float(args.att_hz))
     if float(args.request_heartbeat_hz) > 0:
@@ -158,7 +189,7 @@ def main() -> None:
     t_end = time.time() + float(args.duration)
     last_wall_any: Optional[float] = None
     last_wall_by_type: Dict[str, float] = {}
-    count_by_type: Dict[str, int] = {"LOCAL_POSITION_NED": 0, "ATTITUDE": 0, "HEARTBEAT": 0}
+    count_by_type: Dict[str, int] = {}
     last_hb: Optional[Any] = hb
     last_mode: str = _mode_string(master, hb)
     last_custom_mode: int = int(getattr(hb, "custom_mode", 0))
@@ -167,8 +198,12 @@ def main() -> None:
     last_hb_comp: int
     last_hb_sys, last_hb_comp = _hb_sys_comp(hb)
 
+    home_lat_deg: float = 0.0
+    home_lon_deg: float = 0.0
+    home_alt_m: float = 0.0
+    home_initialized: bool = False
+
     def _sync_mode_from_parser() -> None:
-        """Pull latest HEARTBEAT fields pymavlink already parsed (recv_match skips non-matching types)."""
         nonlocal last_mode, last_custom_mode, last_base_mode, last_hb_sys, last_hb_comp
         st = master.sysid_state.get(int(vehicle_sysid))
         if st is None:
@@ -180,6 +215,9 @@ def main() -> None:
         last_custom_mode = int(getattr(hbm, "custom_mode", 0))
         last_base_mode = int(getattr(hbm, "base_mode", 0))
         last_hb_sys, last_hb_comp = _hb_sys_comp(hbm)
+
+    def _bump_count(mtype: str) -> None:
+        count_by_type[mtype] = int(count_by_type.get(mtype, 0)) + 1
 
     def _append_row(
         wall_ts: float,
@@ -248,11 +286,12 @@ def main() -> None:
         )
         f.flush()
         while time.time() < t_end:
-            want_types = ["LOCAL_POSITION_NED"]
+            if legacy:
+                want_types = ["LOCAL_POSITION_NED"]
+            else:
+                want_types = ["SIM_STATE", "HOME_POSITION"]
             if bool(args.include_attitude):
                 want_types.append("ATTITUDE")
-            # Never use a separate recv_match(type='HEARTBEAT') drain: pymavlink drops non-matching
-            # messages from recv_match, which steals POSITION/ATTITUDE from this socket.
             if bool(args.include_heartbeat):
                 want_types.append("HEARTBEAT")
 
@@ -262,7 +301,6 @@ def main() -> None:
             now = time.time()
             mtype = msg.get_type()
 
-            # INTERPOLATED HEARTBEATs were parsed inside recv_match but not returned; refresh mode.
             _sync_mode_from_parser()
 
             if mtype == "HEARTBEAT":
@@ -290,9 +328,17 @@ def main() -> None:
                     ("", "", "", "", "", ""),
                     ("", "", ""),
                 )
-                count_by_type["HEARTBEAT"] = int(count_by_type.get("HEARTBEAT", 0)) + 1
+                _bump_count("HEARTBEAT")
                 if sum(count_by_type.values()) % 100 == 0:
                     f.flush()
+                continue
+
+            if not legacy and mtype == "HOME_POSITION":
+                hlat, hlon, halt = home_position_lat_lon_alt_m(msg)
+                home_lat_deg = hlat
+                home_lon_deg = hlon
+                home_alt_m = halt
+                home_initialized = True
                 continue
 
             dt_any = (now - last_wall_any) if last_wall_any is not None else ""
@@ -301,21 +347,41 @@ def main() -> None:
             dt_type = (now - prev_t) if prev_t is not None else ""
             last_wall_by_type[mtype] = now
 
-            # Extract fields
-            time_boot_ms = int(getattr(msg, "time_boot_ms", 0))
+            time_boot_ms_v = getattr(msg, "time_boot_ms", None)
+            time_boot_ms = int(time_boot_ms_v) if time_boot_ms_v is not None else ""
+
             x = y = z = vx = vy = vz = ""
             roll = pitch = yaw = ""
-            if mtype == "LOCAL_POSITION_NED":
+
+            if legacy and mtype == "LOCAL_POSITION_NED":
                 x = float(getattr(msg, "x", 0.0))
                 y = float(getattr(msg, "y", 0.0))
                 z = float(getattr(msg, "z", 0.0))
                 vx = float(getattr(msg, "vx", 0.0))
                 vy = float(getattr(msg, "vy", 0.0))
                 vz = float(getattr(msg, "vz", 0.0))
+            elif not legacy and mtype == "SIM_STATE":
+                lat, lon = sim_state_lat_lon_deg(msg)
+                alt_m = float(getattr(msg, "alt", 0.0))
+                if not home_initialized:
+                    home_lat_deg = lat
+                    home_lon_deg = lon
+                    home_alt_m = alt_m
+                    home_initialized = True
+                x, y, z = ned_metres_from_home(
+                    lat, lon, alt_m, home_lat_deg, home_lon_deg, home_alt_m
+                )
+                vx = float(getattr(msg, "vn", 0.0))
+                vy = float(getattr(msg, "ve", 0.0))
+                vz = float(getattr(msg, "vd", 0.0))
+                roll = float(getattr(msg, "roll", 0.0))
+                pitch = float(getattr(msg, "pitch", 0.0))
+                yaw = float(getattr(msg, "yaw", 0.0))
             elif mtype == "ATTITUDE":
                 roll = float(getattr(msg, "roll", 0.0))
                 pitch = float(getattr(msg, "pitch", 0.0))
                 yaw = float(getattr(msg, "yaw", 0.0))
+
             _append_row(
                 now,
                 mtype,
@@ -330,24 +396,13 @@ def main() -> None:
                 (x, y, z, vx, vy, vz),
                 (roll, pitch, yaw),
             )
-            if mtype in count_by_type:
-                count_by_type[mtype] += 1
-            else:
-                count_by_type[mtype] = 1
+            _bump_count(mtype)
             if sum(count_by_type.values()) % 100 == 0:
                 f.flush()
 
-    # Quick summary
-    parts = [
-        "LOCAL_POSITION_NED=%d" % count_by_type.get("LOCAL_POSITION_NED", 0),
-        "ATTITUDE=%d" % count_by_type.get("ATTITUDE", 0),
-        "HEARTBEAT=%d" % count_by_type.get("HEARTBEAT", 0),
-    ]
-    if not bool(args.include_attitude):
-        parts = [parts[0], parts[2]]
-    print("Wrote messages to %s: %s" % (out_path, ", ".join(parts)))
+    parts = [f"{k}={v}" for k, v in sorted(count_by_type.items())]
+    print("Wrote messages to %s: %s" % (out_path, ", ".join(parts) if parts else "(none)"))
 
 
 if __name__ == "__main__":
     main()
-

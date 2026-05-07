@@ -1,0 +1,14 @@
+{
+  "duration_sec": 60.0,
+  "collision_radius_m": 0.2,
+  "num_drones": 4,
+  "scenario": "antena_logic_copy",
+  "csv_columns": "telemetry sigma_xy sigma_z rc_pwm vel_ned",
+  "w_spacing_m": 5.5,
+  "r_vis_alt_m": 2.5,
+  "xy_vis_m": 50.0,
+  "r_vis_xy_axis_m": 12.0,
+  "anchor_id": 1,
+  "log_hz": 20.0,
+  "log_mode": "timer"
+}

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Compare MAVLink LOCAL_POSITION_NED arrival timing across multiple drones on one figure.
+Compare MAVLink position telemetry arrival timing across multiple drones on one figure.
 
 Reads CSVs produced by mavlink_position_rate_logger.py:
-  wall_time, dt_wall, time_boot_ms, x, y, z, vx, vy, vz
+  wall_time, dt_wall_any, time_boot_ms, msg_type, …
 
 Outputs:
   - one PNG with dt_wall-over-time subplots (auto grid)
@@ -28,10 +28,19 @@ def _read_one(path: str) -> Dict[str, List]:
     boot: List[int] = []
     with open(path, "r", encoding="utf-8") as f:
         r = csv.DictReader(f)
+        fields = r.fieldnames or ()
+        has_msg_type = "msg_type" in fields
         for row in r:
+            if has_msg_type:
+                mt = (row.get("msg_type") or "").strip()
+                if mt and mt not in ("LOCAL_POSITION_NED", "SIM_STATE"):
+                    continue
             wall.append(float(row["wall_time"]))
-            boot.append(int(row.get("time_boot_ms", "0") or 0))
-            sdt = (row.get("dt_wall") or "").strip()
+            try:
+                boot.append(int(float(row.get("time_boot_ms") or 0)))
+            except ValueError:
+                boot.append(0)
+            sdt = (row.get("dt_wall") or row.get("dt_wall_any") or "").strip()
             if sdt:
                 try:
                     dt.append(float(sdt))
@@ -111,7 +120,7 @@ def main() -> None:
     # Hide any unused axes
     for j in range(n, len(axes_list)):
         axes_list[j].axis("off")
-    fig.suptitle("LOCAL_POSITION_NED arrival dt_wall over time (per drone)")
+    fig.suptitle("Position telemetry arrival dt_wall over time (per drone)")
     p1 = os.path.join(out_dir, f"mavlink_compare__dt_wall_over_time_{n}d.png")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(p1, dpi=160)
@@ -128,7 +137,7 @@ def main() -> None:
     plt.grid(True, alpha=0.35)
     plt.xlabel("t_rel (s)")
     plt.ylabel("dt_wall (s)")
-    plt.title(f"LOCAL_POSITION_NED dt_wall overlay ({n} drones)")
+    plt.title(f"Position telemetry dt_wall overlay ({n} drones)")
     plt.legend()
     p2 = os.path.join(out_dir, "mavlink_compare__dt_wall_overlay.png")
     plt.tight_layout()

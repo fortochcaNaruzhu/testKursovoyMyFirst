@@ -1,5 +1,5 @@
 """
-Monitors drone position (LOCAL_POSITION_NED) and attitude (ATTITUDE) via MAVLinkWorker.
+Monitors drone NED position and attitude from SIM_STATE via MAVLinkWorker.
 
 No dedicated threads: reads from the worker's thread-safe state cache.
 One MAVLink connection is used only by the worker's single thread.

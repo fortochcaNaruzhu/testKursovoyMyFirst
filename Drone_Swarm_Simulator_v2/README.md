@@ -9,7 +9,7 @@ Drone_Swarm_Simulator_v2/
 ├── launch_simulation.py   # Единая точка входа (одиночный запуск)
 ├── run_batch.py           # Пакетный запуск серии экспериментов
 ├── config/                # Параметры ArduPilot (iris.parm и др.)
-├── core/                  # Ядро: MAVLink, мониторы, PID, логирование
+├── core/                  # Ядро: MAVLink (поза по SIM_STATE в SITL), мониторы, PID, логирование
 ├── scenarios/             # Сценарии (leader_forward_back, square_pid, ...)
 ├── replay/                # Воспроизведение логов в ROS/RViz
 ├── visualizer/            # 2D визуализация (matplotlib): онлайн и replay по CSV
@@ -179,3 +179,51 @@ mkdir -p "$OUTDIR"
 python3 /home/user/Kursov3/test_logov/mavlink_dump_all_txt.py \
   --port 14751 --duration 60 \
   --out "$OUTDIR/mavlink_all_port14751.jsonl"
+
+Зпауск визуализатора (Добавлено небо и пол + таймлайн. всё выведено по умолчанию)
+source /opt/ros/jazzy/setup.bash
+cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+python3 replay/replay_rviz2.py --experiment /home/user/Kursov3/test_logov/antena_logic_copy_run2 --rviz
+
+
+
+
+
+#######Запуск сценария "Антенна" рабочий####### 
+cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+source ../drone_env/bin/activate
+
+OUTDIR=/home/user/Kursov3/test_logov/fntena_logic_copy2_run
+mkdir -p "$OUTDIR"
+
+python launch_simulation.py -s -c fntena_logic_copy2 -n 4 \
+  --no-sitl-console --no-2d-visualizer \
+  --duration 60 \
+  --experiment-dir "$OUTDIR" \
+  --log-mode mavlink
+
+
+#######Запуск визуализации "Антенна" рабочий####### 
+source /opt/ros/jazzy/setup.bash
+cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+python3 replay/replay_rviz2.py --experiment /home/user/Kursov3/test_logov/fntena_logic_copy2_run --rviz
+
+
+
+
+
+#######Запуск построения графиков####### 
+cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+source ../drone_env/bin/activate
+
+python3 scripts/graphics.py \
+  --experiment /home/user/Kursov3/test_logov/antena_logic_copy_run2 \
+  --focus-drone 2
+
+
+  cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+source ../drone_env/bin/activate
+
+python3 scripts/graphics.py \
+  --experiment /home/user/Kursov3/test_logov/fntena_logic_copy2_run \
+  --focus-drone 2

@@ -52,21 +52,26 @@ def send_rc_override(
             controller.last_rc_channels["yaw"] = chan4
 
 
+def _sim_state_msg_id() -> int:
+    """MAVLink message id for SIM_STATE (common.xml)."""
+    return int(getattr(mavutil.mavlink, "MAVLINK_MSG_ID_SIM_STATE", 108))
+
+
 def request_position_stream_rate(master: Any, hz: int = 50) -> None:
     """
-    Request LOCAL_POSITION_NED stream at the given rate.
+    Request SIM_STATE at the given rate (true sim pose; lat/lon → NED in worker).
 
     Args:
         master: MAVLink connection (mavutil.mavlink_connection).
         hz: Desired frequency in Hz (default 50).
     """
-    interval_us = int(1e6 / hz)
+    interval_us = int(1e6 / max(1, hz))
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
         mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
         0,
-        mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED,
+        _sim_state_msg_id(),
         interval_us,
         0,
         0,
@@ -78,23 +83,10 @@ def request_position_stream_rate(master: Any, hz: int = 50) -> None:
 
 def request_attitude_stream_rate(master: Any, hz: int = 50) -> None:
     """
-    Request ATTITUDE stream (roll, pitch, yaw in radians) at the given rate.
+    Request SIM_STATE at the given rate (roll/pitch/yaw come from the same message).
 
     Args:
         master: MAVLink connection (mavutil.mavlink_connection).
         hz: Desired frequency in Hz (default 50).
     """
-    interval_us = int(1e6 / hz)
-    master.mav.command_long_send(
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-        0,
-        mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
-        interval_us,
-        0,
-        0,
-        0,
-        0,
-        0,
-    )
+    request_position_stream_rate(master, hz=hz)

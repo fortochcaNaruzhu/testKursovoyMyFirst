@@ -30,7 +30,7 @@ INS_GYR_CAL      0
 # ANGLE_MAX        5500
 
 # === MAVLink streamrate fix (prevent fall-back to ~4 Hz) ===
-# Set POSITION stream rate (GLOBAL_POSITION_INT + LOCAL_POSITION_NED) for several channels.
+# Stream rates (GLOBAL_POSITION_INT / др.): симулятор также запрашивает SIM_STATE по MAVLink из Python.
 # In SITL/UDP setups, the exact SRx channel mapping can vary; setting SR0..SR3 covers typical cases.
 SR0_POSITION     50
 SR1_POSITION     50
@@ -44,3 +44,13 @@ SERIAL0_OPTIONS  4096
 SERIAL1_OPTIONS  4096
 SERIAL2_OPTIONS  4096
 SERIAL3_OPTIONS  4096
+
+# === SITL wind model ===
+# Direction wind is coming from, true degrees (180 = from South).
+SIM_WIND_DIR    90
+# Base wind speed, m/s.
+SIM_WIND_SPD    40
+# Random wind variation/turbulence, m/s (0 = steady wind).
+SIM_WIND_TURB   0
+# Wind change time constant, seconds.
+SIM_WIND_TC     5

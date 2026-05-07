@@ -8,7 +8,8 @@ Anatoliy/swarm_mavic/grid_antenna: каждый агент использует 
 видимого соседа сверху/снизу по высоте и/или якорь как пейсмейкер.
 
 Управление через RC override:
-- roll/pitch: мягкий PID на удержание оси (x,y) якоря
+- roll/pitch: протокол 1max по осям x,y (как в grid_antenna.tex): сближение относительно
+  видимых соседей и якоря; якорь-дрон дополнительно удерживает колонку через ошибку к своей точке.
 - throttle: bang-bang / насыщенная команда по знаку sigma (altitude self-distribution)
 """
 
@@ -27,7 +28,11 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from core.control import DroneController, PIDRegulator
-from core.logging.csv_logger import CSV_HEADER, write_metadata, write_row
+from core.logging.csv_logger import (
+    CSV_HEADER_ANTENA_TELEMETRY,
+    write_metadata,
+    write_row_antena_telemetry,
+)
 from core.mavlink.utils import RC_NEUTRAL
 
 try:
@@ -49,9 +54,10 @@ _HOME_Y_OFFSET_STEP_M = 2.0
 CONTROL_HZ = 20.0
 CONTROL_DT = 1.0 / CONTROL_HZ
 
-# XY lock to anchor line
+# XY: protocol 1max (neighbor + beacon), separate axis visibility (grid_antenna / §7.4)
 XY_OUTPUT_LIMIT = 110.0
 XY_DEADBAND_M = 0.06
+R_VIS_XY_AXIS_M = 12.0
 
 # Altitude self-distribution (scalar state = altitude, m)
 W_SPACING_M = 5.5
@@ -114,12 +120,106 @@ def _clamp_rc(pwm: int, lo: int = 1100, hi: int = 1900) -> int:
     return max(lo, min(hi, int(pwm)))
 
 
+def _ned_velocity(controller: DroneController) -> Tuple[float, float, float]:
+    """SIM_STATE velocity in NED (m/s): vz positive down."""
+    if controller.velocity_monitor is None:
+        return (0.0, 0.0, 0.0)
+    try:
+        vel = controller.velocity_monitor.get_velocity()
+        return (
+            float(vel.get("vx", 0.0)),
+            float(vel.get("vy", 0.0)),
+            float(vel.get("vz", 0.0)),
+        )
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+
+def _default_antena_telemetry_row() -> Dict[str, float]:
+    return {
+        "sigma_x": 0.0,
+        "sigma_y": 0.0,
+        "sigma_z": 0.0,
+        "rc_roll": float(RC_NEUTRAL),
+        "rc_pitch": float(RC_NEUTRAL),
+        "rc_throttle": float(RC_NEUTRAL),
+        "rc_yaw": float(RC_NEUTRAL),
+        "vx": 0.0,
+        "vy": 0.0,
+        "vz": 0.0,
+    }
+
+
+def _telemetry_from_controller(controller: DroneController) -> Dict[str, float]:
+    raw = getattr(controller, "_antena_telemetry", None)
+    if not isinstance(raw, dict):
+        return _default_antena_telemetry_row()
+    out = _default_antena_telemetry_row()
+    out.update(raw)
+    return out
+
+
 def _deadband(x: float, band: float) -> float:
     return 0.0 if abs(x) < band else x
 
 
 def _xi(g: float) -> float:
     return math.tanh(float(g))
+
+
+def _d_plus_minus_1max_axis(deltas_along_axis: List[float], r_vis: float) -> Tuple[float, float]:
+    """
+    Protocol **1max** along one scalar coordinate (Matveev–Konovalov / grid_antenna):
+      I+ = { Δ : 0 < Δ < R_vis },  d+ = max_{I+} |Δ|   (or 0 if empty)
+      I- = { Δ : -R_vis < Δ < 0 }, d- = max_{I-} |Δ|   (or 0 if empty)
+    """
+    r = float(r_vis)
+    d_plus = 0.0
+    d_minus = 0.0
+    for d in deltas_along_axis:
+        fd = float(d)
+        if r > fd > 0:
+            d_plus = max(d_plus, fd)
+        elif r > -fd > 0:
+            d_minus = max(d_minus, -fd)
+    return d_plus, d_minus
+
+
+def _xy_1max_pitch_roll_errors(
+    my_pos: Dict[str, float],
+    anchor_pos: Dict[str, float],
+    peer_positions: Dict[int, Dict[str, float]],
+    *,
+    anchor_id: int,
+    r_vis_xy_axis_m: float,
+    xy_gate_m: float,
+) -> Tuple[float, float]:
+    """
+    Horizontal Ξ-components for RC PID (sign aligned with previous anchor lock):
+      err_x ≈ Ξ(d_x+) - Ξ(d_x-), err_y ≈ Ξ(d_y+) - Ξ(d_y-)
+    Informants: visible peers (within xy_gate disk) + beacon at anchor_pos.
+    Duplicate anchor drone entry in peers is skipped (beacon already covers it).
+    """
+    mx = float(my_pos.get("x", 0.0))
+    my = float(my_pos.get("y", 0.0))
+    dx_list: List[float] = [float(anchor_pos.get("x", 0.0)) - mx]
+    dy_list: List[float] = [float(anchor_pos.get("y", 0.0)) - my]
+    gate = float(xy_gate_m)
+    for pid, p in peer_positions.items():
+        if int(pid) == int(anchor_id):
+            continue
+        px = float(p.get("x", 0.0))
+        py = float(p.get("y", 0.0))
+        ddx = px - mx
+        ddy = py - my
+        if gate > 0.0 and (ddx * ddx + ddy * ddy) ** 0.5 > gate:
+            continue
+        dx_list.append(ddx)
+        dy_list.append(ddy)
+
+    dpx, dmx = _d_plus_minus_1max_axis(dx_list, r_vis_xy_axis_m)
+    dpy, dmy = _d_plus_minus_1max_axis(dy_list, r_vis_xy_axis_m)
+    return _xi(dpx) - _xi(dmx), _xi(dpy) - _xi(dmy)
 
 
 def _nearest_above_below_alt(
@@ -169,7 +269,10 @@ def _sigma_altitude(
     v_alt: float,
 ) -> float:
     """
-    One-dimensional sigma from KA008/grid_antenna style:
+    Скаляр sigma для вертикали (KA008-стиль с демпфированием по скорости).
+    В протоколе~2 из grid_antenna.tex при пустом множестве нижних соседей вместо шага w
+    подставляют R_vis; здесь для отсутствующего верха/низа используются r_vis и w —
+    это не дословное совпадение с формулой~(5)+(протокол~2) в PDF.
       sigma = v - xi(d_plus_eff) + xi(d_minus_eff)
     Where missing neighbor distances are replaced by:
       d_plus_eff = r_vis (no peer above)
@@ -293,6 +396,7 @@ def _control_loop(
     w_spacing_m: float,
     r_vis_alt_m: float,
     xy_vis_m: float,
+    r_vis_xy_axis_m: float,
     z_pwm_max: int,
     z_pwm_min_step: int,
 ) -> None:
@@ -312,16 +416,44 @@ def _control_loop(
 
         others = controller.get_other_drones_positions()
         anchor_pos = others.get(int(anchor_id))
+        vx, vy, vz = _ned_velocity(controller)
         if anchor_pos is None:
+            controller._antena_telemetry = {
+                "sigma_x": 0.0,
+                "sigma_y": 0.0,
+                "sigma_z": 0.0,
+                "rc_roll": float(RC_NEUTRAL),
+                "rc_pitch": float(RC_NEUTRAL),
+                "rc_throttle": float(RC_NEUTRAL),
+                "rc_yaw": float(RC_NEUTRAL),
+                "vx": vx,
+                "vy": vy,
+                "vz": vz,
+            }
             controller.worker.send_rc_override(
                 RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, controller=controller
             )
             time.sleep(CONTROL_DT)
             continue
 
-        # --- XY lock to anchor column ---
-        err_x = _deadband(float(anchor_pos.get("x", 0.0)) - float(my_pos.get("x", 0.0)), XY_DEADBAND_M)
-        err_y = _deadband(float(anchor_pos.get("y", 0.0)) - float(my_pos.get("y", 0.0)), XY_DEADBAND_M)
+        # --- XY: 1max toward beacon + neighbors (grid_antenna); anchor keeps column on PID ---
+        # sigma_x / sigma_y: скаляр закона до deadband (позиция к якорю или выход 1max).
+        if did == int(anchor_id):
+            sigma_x = float(anchor_pos.get("x", 0.0)) - float(my_pos.get("x", 0.0))
+            sigma_y = float(anchor_pos.get("y", 0.0)) - float(my_pos.get("y", 0.0))
+            err_x = _deadband(sigma_x, XY_DEADBAND_M)
+            err_y = _deadband(sigma_y, XY_DEADBAND_M)
+        else:
+            sigma_x, sigma_y = _xy_1max_pitch_roll_errors(
+                my_pos,
+                anchor_pos,
+                others,
+                anchor_id=int(anchor_id),
+                r_vis_xy_axis_m=float(r_vis_xy_axis_m),
+                xy_gate_m=float(xy_vis_m),
+            )
+            err_x = _deadband(sigma_x, XY_DEADBAND_M)
+            err_y = _deadband(sigma_y, XY_DEADBAND_M)
         pitch_out = pitch_pid.update(err_x, dt=CONTROL_DT)
         roll_out = roll_pid.update(err_y, dt=CONTROL_DT)
         pitch = _clamp_rc(RC_NEUTRAL - int(pitch_out))
@@ -330,10 +462,23 @@ def _control_loop(
         # --- Anchor: hold altitude at TAKEOFF_ALT_M (do not participate in distribution) ---
         if did == int(anchor_id) and anchor_z_pid is not None:
             alt_me = _altitude_m(my_pos)
-            alt_err = _deadband(float(TAKEOFF_ALT_M) - float(alt_me), 0.05)
+            sigma_z = float(TAKEOFF_ALT_M) - float(alt_me)
+            alt_err = _deadband(sigma_z, 0.05)
             # Positive error => need go up => increase throttle above neutral.
             thr_out = anchor_z_pid.update(alt_err, dt=CONTROL_DT)
             throttle = _clamp_rc(RC_NEUTRAL + int(thr_out))
+            controller._antena_telemetry = {
+                "sigma_x": float(sigma_x),
+                "sigma_y": float(sigma_y),
+                "sigma_z": float(sigma_z),
+                "rc_roll": float(roll),
+                "rc_pitch": float(pitch),
+                "rc_throttle": float(throttle),
+                "rc_yaw": float(RC_NEUTRAL),
+                "vx": vx,
+                "vy": vy,
+                "vz": vz,
+            }
             controller.worker.send_rc_override(
                 roll, pitch, throttle, RC_NEUTRAL, controller=controller
             )
@@ -352,24 +497,30 @@ def _control_loop(
         )
 
         # Altitude speed from SIM_STATE (vd as vz): vz is DOWN positive => v_alt = -vz.
-        v_alt = 0.0
-        if controller.velocity_monitor is not None:
-            try:
-                vel = controller.velocity_monitor.get_velocity()
-                v_alt = -float(vel.get("vz", 0.0))
-            except Exception:
-                v_alt = 0.0
+        v_alt = -vz
 
-        sigma = _sigma_altitude(
+        sigma_z = _sigma_altitude(
             d_plus,
             d_minus,
             w=float(w_spacing_m),
             r_vis=float(r_vis_alt_m),
             v_alt=float(v_alt),
         )
-        thr_delta = _pwm_from_sigma(sigma, int(z_pwm_max), int(z_pwm_min_step))
+        thr_delta = _pwm_from_sigma(sigma_z, int(z_pwm_max), int(z_pwm_min_step))
         throttle = _clamp_rc(RC_NEUTRAL + int(thr_delta))
 
+        controller._antena_telemetry = {
+            "sigma_x": float(sigma_x),
+            "sigma_y": float(sigma_y),
+            "sigma_z": float(sigma_z),
+            "rc_roll": float(roll),
+            "rc_pitch": float(pitch),
+            "rc_throttle": float(throttle),
+            "rc_yaw": float(RC_NEUTRAL),
+            "vx": vx,
+            "vy": vy,
+            "vz": vz,
+        }
         controller.worker.send_rc_override(roll, pitch, throttle, RC_NEUTRAL, controller=controller)
         time.sleep(CONTROL_DT)
 
@@ -394,6 +545,13 @@ def main() -> None:
     parser.add_argument("--w", type=float, default=W_SPACING_M, help="Desired vertical spacing (m)")
     parser.add_argument("--r-vis", type=float, default=R_VIS_ALT_M, help="Visibility distance along altitude (m)")
     parser.add_argument("--xy-vis", type=float, default=XY_VIS_M, help="Horizontal gating distance to consider a peer (m)")
+    parser.add_argument(
+        "--r-vis-xy-axis",
+        type=float,
+        default=R_VIS_XY_AXIS_M,
+        dest="r_vis_xy_axis",
+        help="R_vis along each horizontal axis for protocol 1max essential neighbors (m)",
+    )
     parser.add_argument("--z-pwm-max", type=int, default=Z_PWM_MAX, help="Max throttle PWM delta from neutral for sigma")
     parser.add_argument("--z-pwm-min-step", type=int, default=Z_PWM_MIN_STEP, help="Min PWM step when sigma != 0")
 
@@ -499,7 +657,7 @@ def main() -> None:
         did = int(cfg["id"])
         path = os.path.join(experiment_dir, f"drone_{did}.csv")
         f = open(path, "w", encoding="utf-8")
-        f.write(CSV_HEADER + "\n")
+        f.write(CSV_HEADER_ANTENA_TELEMETRY + "\n")
         f.flush()
         experiment_log_files[did] = f
 
@@ -508,11 +666,13 @@ def main() -> None:
         float(args.duration),
         0.2,
         num_drones,
-        "antena_logic",
+        "antena_logic_copy",
         extra={
+            "csv_columns": "telemetry sigma_xy sigma_z rc_pwm vel_ned",
             "w_spacing_m": float(args.w),
             "r_vis_alt_m": float(args.r_vis),
             "xy_vis_m": float(args.xy_vis),
+            "r_vis_xy_axis_m": float(args.r_vis_xy_axis),
             "anchor_id": anchor_id,
             "log_hz": float(args.log_hz),
             "log_mode": str(args.log_mode),
@@ -565,7 +725,8 @@ def main() -> None:
                         except Exception:
                             att = att
                     try:
-                        write_row(
+                        tm = _telemetry_from_controller(c)
+                        write_row_antena_telemetry(
                             experiment_log_files[did],
                             did,
                             float(t_rel),
@@ -577,6 +738,16 @@ def main() -> None:
                             float(att.get("rz", 0.0)),
                             0,
                             sitl_time_boot_s=sitl_boot_s,
+                            sigma_x=float(tm["sigma_x"]),
+                            sigma_y=float(tm["sigma_y"]),
+                            sigma_z=float(tm["sigma_z"]),
+                            rc_roll=int(tm["rc_roll"]),
+                            rc_pitch=int(tm["rc_pitch"]),
+                            rc_throttle=int(tm["rc_throttle"]),
+                            rc_yaw=int(tm["rc_yaw"]),
+                            vx=float(tm["vx"]),
+                            vy=float(tm["vy"]),
+                            vz=float(tm["vz"]),
                         )
                     except Exception:
                         pass
@@ -593,7 +764,8 @@ def main() -> None:
                             except Exception:
                                 att = att
                         try:
-                            write_row(
+                            tm = _telemetry_from_controller(c)
+                            write_row_antena_telemetry(
                                 experiment_log_files[did],
                                 did,
                                 float(t_rel),
@@ -605,6 +777,16 @@ def main() -> None:
                                 float(att.get("rz", 0.0)),
                                 0,
                                 sitl_time_boot_s=None,
+                                sigma_x=float(tm["sigma_x"]),
+                                sigma_y=float(tm["sigma_y"]),
+                                sigma_z=float(tm["sigma_z"]),
+                                rc_roll=int(tm["rc_roll"]),
+                                rc_pitch=int(tm["rc_pitch"]),
+                                rc_throttle=int(tm["rc_throttle"]),
+                                rc_yaw=int(tm["rc_yaw"]),
+                                vx=float(tm["vx"]),
+                                vy=float(tm["vy"]),
+                                vz=float(tm["vz"]),
                             )
                         except Exception:
                             pass
@@ -634,6 +816,7 @@ def main() -> None:
                 "w_spacing_m": float(args.w),
                 "r_vis_alt_m": float(args.r_vis),
                 "xy_vis_m": float(args.xy_vis),
+                "r_vis_xy_axis_m": float(args.r_vis_xy_axis),
                 "z_pwm_max": int(args.z_pwm_max),
                 "z_pwm_min_step": int(args.z_pwm_min_step),
             },

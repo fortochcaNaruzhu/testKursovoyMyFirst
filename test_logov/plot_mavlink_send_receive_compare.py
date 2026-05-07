@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Compare send-timing vs receive-timing for MAVLink LOCAL_POSITION_NED logs.
+Compare send-timing vs receive-timing for MAVLink position telemetry logs.
 
 Input CSV is produced by mavlink_position_rate_logger.py:
-  wall_time, dt_wall, time_boot_ms, x, y, z, vx, vy, vz
+  wall_time, dt_wall_any, time_boot_ms, msg_type, …
 
 Key idea:
   - dt_wall      : inter-arrival time on the logger machine (receive side)
@@ -31,10 +31,19 @@ def _read(path: str) -> Tuple[List[float], List[float], List[int]]:
     boot_ms: List[int] = []
     with open(path, "r", encoding="utf-8") as f:
         r = csv.DictReader(f)
+        fields = r.fieldnames or ()
+        has_msg_type = "msg_type" in fields
         for row in r:
+            if has_msg_type:
+                mt = (row.get("msg_type") or "").strip()
+                if mt and mt not in ("LOCAL_POSITION_NED", "SIM_STATE"):
+                    continue
             wall.append(float(row["wall_time"]))
-            boot_ms.append(int(row.get("time_boot_ms", "0") or 0))
-            sdt = (row.get("dt_wall") or "").strip()
+            try:
+                boot_ms.append(int(float(row.get("time_boot_ms") or 0)))
+            except ValueError:
+                boot_ms.append(0)
+            sdt = (row.get("dt_wall") or row.get("dt_wall_any") or "").strip()
             if sdt:
                 try:
                     dt_wall.append(float(sdt))

@@ -77,16 +77,19 @@ class DroneController:
         self.coords_monitor = CoordsMonitor(self.worker)
         self.velocity_monitor = VelocityMonitor(self.worker)
 
-    def initialize(self, init_steps: List[Dict[str, Any]]) -> None:
+    def initialize(self, init_steps: List[Dict[str, Any]]) -> bool:
         """Run init sequence (arm, takeoff, set mode, etc.) via worker.
 
         Args:
             init_steps: List of command dicts for worker.run_init_sequence()
                 (e.g. set_mode, sleep, arm, takeoff, rc_override, request_position_stream).
+
+        Returns:
+            True if the MAVLink worker completed all steps within its timeout.
         """
         if self.worker is None:
-            return
-        self.worker.run_init_sequence(init_steps)
+            return False
+        return bool(self.worker.run_init_sequence(init_steps))
 
     def start_rc_keepalive(self) -> None:
         """Start a daemon thread that periodically sends RC_OVERRIDE via worker."""

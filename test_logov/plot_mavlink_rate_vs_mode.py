@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Plot SITL-side LOCAL_POSITION_NED effective rate (from Δtime_boot_ms) vs wall-clock time,
+Plot SITL-side position telemetry effective rate (LOCAL_POSITION_NED or SIM_STATE; Δtime_boot_ms) vs wall-clock time,
 with background bands for flight mode (GUIDED / POSHOLD / …).
 
 Input: CSV from mavlink_position_rate_logger.py (msg_type, wall_time, time_boot_ms, mode, …).
@@ -59,7 +59,7 @@ def _load_mode_segments(path: str) -> List[Tuple[float, float, str]]:
 
 def _load_position_rate(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Returns (wall_rel, hz_boot, mode_at_row) for LOCAL_POSITION_NED rows only.
+    Returns (wall_rel, hz_boot, mode_at_row) for position rows only (LOCAL_POSITION_NED or SIM_STATE).
     hz_boot = 1 / Δ(time_boot_ms) in seconds between consecutive position rows.
     """
     wt_list: List[float] = []
@@ -68,7 +68,7 @@ def _load_position_rate(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     with open(path, "r", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
-            if row.get("msg_type") != "LOCAL_POSITION_NED":
+            if row.get("msg_type") not in ("LOCAL_POSITION_NED", "SIM_STATE"):
                 continue
             try:
                 wt = float(row["wall_time"])
@@ -162,7 +162,7 @@ def main() -> None:
                 x_line = wall_mid[off : off + sm.size]
                 ax.plot(x_line, sm, color="crimson", lw=1.4, zorder=3, label=f"pos rate (smoothed, w={w})")
 
-        ax.set_title(f"UDP tap port {_port_label(path)} — LOCAL_POSITION_NED rate from Δtime_boot_ms")
+        ax.set_title(f"UDP tap port {_port_label(path)} — position rate from Δtime_boot_ms")
         ax.set_xlabel("Time since first row in file (s)")
         ax.set_ylabel("Hz (SITL send cadence ~1/Δboot)")
         ax.set_xlim(0.0, t_max * 1.02)

@@ -522,6 +522,7 @@ def coordinate_exchange_loop(
                                 att["ry"],
                                 att["rz"],
                                 hc,
+                                sitl_time_boot_s=None,
                             )
                             wrote_this_iter = True
                 if wrote_this_iter:
