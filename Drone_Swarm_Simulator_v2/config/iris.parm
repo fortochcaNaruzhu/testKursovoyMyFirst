@@ -16,7 +16,8 @@ ATC_RAT_PIT_D    0.0003
 ATC_RAT_RLL_D    0.0003  
 ATC_RAT_YAW_D    0.000001
 
-AHRS_EKF_TYPE    10         # Use sim AHRS
+AHRS_EKF_TYPE    3         # Use sim AHRS
+EK3_ENABLE       1
 ARMING_CHECK	 0    # No RC requirements
 MOT_THST_EXPO    0          # No motor exponential
 SCHED_LOOP_RATE  300        
@@ -49,8 +50,23 @@ SERIAL3_OPTIONS  4096
 # Direction wind is coming from, true degrees (180 = from South).
 SIM_WIND_DIR    90
 # Base wind speed, m/s.
-SIM_WIND_SPD    40
+SIM_WIND_SPD    0
 # Random wind variation/turbulence, m/s (0 = steady wind).
 SIM_WIND_TURB   0
 # Wind change time constant, seconds.
 SIM_WIND_TC     5
+
+
+
+
+# === SITL sensor noise ===
+# GPS altitude noise amplitude, m.
+SIM_GPS1_NOISE   0 #1.5
+SIM_GPS1_DRFTALT 0 #0.5
+SIM_GPS1_VERR_X  0 #0.2
+SIM_GPS1_VERR_Y  0 #0.2
+SIM_GPS1_VERR_Z  0 #0.2
+# Barometer altitude noise, m.
+SIM_BARO_RND     0 #0.3
+# Barometer altitude drift, m/s.
+SIM_BARO_DRIFT   0 #0.01

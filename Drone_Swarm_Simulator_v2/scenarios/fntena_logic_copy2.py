@@ -2,13 +2,15 @@
 Сценарий «fntena_logic_copy2»:
 Вертикальная «антенна» над якорем с законом максимально близким к
 `Anatoliy/swarm_mavic/grid_antenna` (PointAgent.perform / control_force).
-Для SITL горизонталь отделена от вертикального строя: X/Y тянутся к якорной
-линии, а соседский закон распределения применяется по Z.
+Видимые соседи выбираются по всем осям X/Y/Z как в `grid_antenna`; команды
+по X/Y формируются из соседского sigma как u=clip(-sigma, -1, 1) и линейно
+масштабируются в RC PWM, а Z дополнительно проходит через PI-слой для
+согласования с RC/POSHOLD.
 
 Отличия от "antena_logic copy.py":
 - по X/Y/Z считаем sigma_b = v_b - tanh(d_b_plus) + tanh(d_b_minus)
-- X/Y удерживаются PID-регулятором в якорной колонне
-- Z управляется bang-bang: u_z = -sign(sigma_z) (маппинг прямо в RC PWM)
+- X/Y управляются непрерывным sigma_x/sigma_y из локального соседского закона
+- Z управляется по sigma_z с PI-адаптацией RC PWM
 - выбор соседей как в grid_antenna: ближайший по знаку проекции на каждой оси
   среди видимых по евклидовому радиусу R_vis.
 
@@ -62,21 +64,12 @@ R_VIS_M = 2.5
 W_SPACING_M = 0.8
 AXIS_EPS_M = 1e-4
 
-# XY lock to anchor column.
-XY_OUTPUT_LIMIT = 150.0
-XY_DEADBAND_M = 0.015
-XY_ROLL_KP = 280.0
-XY_ROLL_KI = 12.0
-XY_ROLL_KD = 150.0
-XY_ROLL_INTEGRAL_LIMIT = 3.0
-XY_PITCH_KP = 320.0
-XY_PITCH_KI = 12.0
-XY_PITCH_KD = 180.0
-XY_PITCH_INTEGRAL_LIMIT = 3.0
-
-# Legacy XY bang-bang CLI knobs are accepted for compatibility; PID uses XY_OUTPUT_LIMIT.
+# XY RC mapping for grid_antenna-like sigma control.
+RC_MIN = 1100
+RC_MAX = 1900
 XY_PWM_MAX = 110
 XY_PWM_MIN_STEP = 18
+XY_SIGMA_DEADBAND = 0.04
 
 # Z RC bang-bang mapping (PWM delta around 1500).
 # POSHOLD has inertia and delay; pure saturated bang-bang caused a persistent
@@ -94,27 +87,11 @@ BOOTSTRAP_STEP_PWM = 35
 
 # Allow baro/EKF to settle after MAVLink connect before ARM.
 POST_CONNECT_SETTLE_SEC = 7.0
-
-INIT_STEPS = [
-    {"type": "set_mode", "mode_id": 4},  # GUIDED
-    {"type": "sleep", "sec": 1.0},
-    {"type": "arm"},
-    {"type": "sleep", "sec": 4.0},
-    {"type": "takeoff", "alt_m": 5.0},
-    {"type": "sleep", "sec": 6.0},
-    {"type": "set_mode", "mode_id": 16},  # POSHOLD
-    {"type": "sleep", "sec": 1.0},
-    {"type": "set_mode", "mode_id": 16},  # POSHOLD retry
-    {
-        "type": "rc_override",
-        "chan1": RC_NEUTRAL,
-        "chan2": RC_NEUTRAL,
-        "chan3": RC_NEUTRAL,
-        "chan4": RC_NEUTRAL,
-    },
-    {"type": "sleep", "sec": 0.3},
-]
-
+INIT_POSITION_ESTIMATE_TIMEOUT_SEC = 35.0
+INIT_TAKEOFF_ALT_M = 5.0
+INIT_TOTAL_TIMEOUT_SEC = 60.0
+INIT_TAKEOFF_CONFIRM_TIMEOUT_SEC = 10.0
+INIT_BARRIER_TIMEOUT_SEC = 140.0
 
 def _did_offset_y(did: int) -> float:
     return float(did - 1) * _HOME_Y_OFFSET_STEP_M
@@ -131,32 +108,108 @@ def _altitude_m(pos_common: Dict[str, float]) -> float:
     return -float(pos_common.get("z", 0.0))
 
 
-def _clamp_rc(pwm: int, lo: int = 1100, hi: int = 1900) -> int:
+def _wait_for_position_stream(controller: DroneController, timeout_s: float) -> bool:
+    """Wait for fresh SIM_STATE position samples before sending arm/takeoff."""
+    worker = getattr(controller, "worker", None)
+    deadline = time.time() + float(timeout_s)
+    fresh_samples = 0
+    last_seq = worker.get_position_seq() if worker is not None and hasattr(worker, "get_position_seq") else 0
+
+    while time.time() < deadline:
+        if worker is not None and hasattr(worker, "wait_for_new_position"):
+            remaining = max(0.0, min(0.5, deadline - time.time()))
+            sample = worker.wait_for_new_position(last_seq, timeout_s=remaining)
+            if sample is None:
+                continue
+            last_seq, pos, _sitl_boot_s = sample
+        elif worker is not None and hasattr(worker, "get_position"):
+            pos = worker.get_position()
+            time.sleep(0.1)
+        else:
+            pos = controller.get_position()
+            time.sleep(0.1)
+
+        if pos is None:
+            fresh_samples = 0
+            continue
+        if any(abs(float(pos.get(axis, 0.0))) > 1e-6 for axis in ("x", "y", "z")):
+            return True
+        fresh_samples += 1
+        if fresh_samples >= 3:
+            return True
+    return False
+
+
+def _wait_for_position_estimate(controller: DroneController, timeout_s: float) -> bool:
+    """Wait until ArduPilot's EKF publishes LOCAL_POSITION_NED before arm/takeoff."""
+    worker = getattr(controller, "worker", None)
+    if worker is None:
+        return False
+    try:
+        controller.initialize([{"type": "request_estimated_position_stream", "hz": 20}])
+    except Exception:
+        pass
+
+    deadline = time.time() + float(timeout_s)
+    stable_samples = 0
+    last_seq = (
+        worker.get_estimated_position_seq()
+        if hasattr(worker, "get_estimated_position_seq")
+        else 0
+    )
+    while time.time() < deadline:
+        if not hasattr(worker, "wait_for_new_estimated_position"):
+            return True
+        remaining = max(0.0, min(0.5, deadline - time.time()))
+        sample = worker.wait_for_new_estimated_position(last_seq, timeout_s=remaining)
+        if sample is None:
+            continue
+        last_seq, pos, _sitl_boot_s = sample
+        if pos is None:
+            stable_samples = 0
+            continue
+        if all(math.isfinite(float(pos.get(axis, 0.0))) for axis in ("x", "y", "z")):
+            stable_samples += 1
+            if stable_samples >= 3:
+                return True
+        else:
+            stable_samples = 0
+    return False
+
+
+def _wait_for_takeoff_alt(
+    controller: DroneController,
+    target_alt_m: float,
+    timeout_s: float = INIT_TAKEOFF_CONFIRM_TIMEOUT_SEC,
+    tol_m: float = 0.45,
+) -> bool:
+    deadline = time.time() + float(timeout_s)
+    min_alt_m = float(target_alt_m) - float(tol_m)
+    while time.time() < deadline:
+        try:
+            if _altitude_m(_pos_common(controller)) >= min_alt_m:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return False
+
+
+def _clamp_rc(pwm: int, lo: int = RC_MIN, hi: int = RC_MAX) -> int:
     return max(lo, min(hi, int(pwm)))
+
+
+def _unit_to_pwm(u: float, *, invert: bool = False) -> int:
+    """Map normalized control u in [-1, 1] to RC PWM in [1100, 1900]."""
+    unit = max(-1.0, min(1.0, float(u)))
+    if invert:
+        unit = -unit
+    pwm = float(RC_NEUTRAL) + unit * ((float(RC_MAX) - float(RC_MIN)) / 2.0)
+    return _clamp_rc(round(pwm), RC_MIN, RC_MAX)
 
 
 def _deadband(x: float, band: float) -> float:
     return 0.0 if abs(x) < band else x
-
-
-def _pid_xy() -> Tuple[PIDRegulator, PIDRegulator]:
-    roll_pid = PIDRegulator(
-        kp=XY_ROLL_KP,
-        ki=XY_ROLL_KI,
-        kd=XY_ROLL_KD,
-        integral_limit=XY_ROLL_INTEGRAL_LIMIT,
-        output_limit=XY_OUTPUT_LIMIT,
-        derivative_alpha=0.65,
-    )
-    pitch_pid = PIDRegulator(
-        kp=XY_PITCH_KP,
-        ki=XY_PITCH_KI,
-        kd=XY_PITCH_KD,
-        integral_limit=XY_PITCH_INTEGRAL_LIMIT,
-        output_limit=XY_OUTPUT_LIMIT,
-        derivative_alpha=0.65,
-    )
-    return roll_pid, pitch_pid
 
 
 def _pid_z_sigma(output_limit: float) -> PIDRegulator:
@@ -270,11 +323,12 @@ def _distances_grid_antenna_pointagent(
     r_vis: float,
 ) -> Tuple[float, float, float, float, float, float]:
     """
-    Emulate `PointAgent.perform` distances filling (utils.py):
-    - if peers present: use nearest distances and fill missing by anchor_dir:
-        if anchor_dir[i] <= 0: z dirs -> w, else 0 ; else -> R_vis
-    - if no peers: fill by anchor_dir only:
-        if item >= 0 => R_vis * item ; else z dirs => -w*item ; else 0
+    Emulate grid_antenna-like distance filling.
+
+    X/Y are anonymous: missing horizontal neighbors mean zero desired distance
+    on that side. This makes an agent collapse horizontally toward any visible
+    one-sided neighbor instead of using the anchor direction as a global target.
+    Z still uses anchor_dir/w/R_vis to form the vertical antenna spacing.
     """
     r = float(r_vis)
     wv = float(w)
@@ -284,11 +338,10 @@ def _distances_grid_antenna_pointagent(
         out: List[float] = []
         for i in range(6):
             if mins[i] is None:
-                if float(anchor_dir[i]) <= 0:
-                    if i in (2, 5):
-                        out.append(wv)
-                    else:
-                        out.append(0.0)
+                if i not in (2, 5):
+                    out.append(0.0)
+                elif float(anchor_dir[i]) <= 0:
+                    out.append(wv)
                 else:
                     out.append(r)
             else:
@@ -296,13 +349,12 @@ def _distances_grid_antenna_pointagent(
         return (out[0], out[1], out[2], out[3], out[4], out[5])
     out2: List[float] = []
     for i, item in enumerate(anchor_dir):
-        if float(item) >= 0:
+        if i not in (2, 5):
+            out2.append(0.0)
+        elif float(item) >= 0:
             out2.append(r * float(item))
         else:
-            if i in (2, 5):
-                out2.append(-wv * float(item))
-            else:
-                out2.append(0.0)
+            out2.append(-wv * float(item))
     return (out2[0], out2[1], out2[2], out2[3], out2[4], out2[5])
 
 
@@ -313,6 +365,14 @@ def _sigma_from_distances(distances: Tuple[float, float, float, float, float, fl
     sigma_y = float(vy) - _xi(d_y_plus) + _xi(d_y_minus)
     sigma_z = float(vz) - _xi(d_z_plus) + _xi(d_z_minus)
     return (sigma_x, sigma_y, sigma_z)
+
+
+def _xy_unit_from_sigma(sigma: float) -> float:
+    """Continuous neighbor-sigma control u=clip(-sigma, -1, 1), with deadband."""
+    s = float(sigma)
+    if abs(s) < float(XY_SIGMA_DEADBAND):
+        return 0.0
+    return max(-1.0, min(1.0, -s))
 
 
 def _throttle_delta_from_alt_error(alt_error_m: float, pwm_max: int, pwm_min_step: int) -> int:
@@ -333,7 +393,7 @@ def initialize_drone_parallel(
     *,
     heartbeat_timeout_s: Optional[float],
     position_timeout_s: float = 10.0,
-    barrier_timeout_sec: float = 60.0,
+    barrier_timeout_sec: float = INIT_BARRIER_TIMEOUT_SEC,
 ) -> None:
     try:
         did = controller.config.get("id")
@@ -345,16 +405,73 @@ def initialize_drone_parallel(
         else:
             controller.connect()
         time.sleep(float(POST_CONNECT_SETTLE_SEC))
-        if not controller.initialize(list(INIT_STEPS)):
-            raise TimeoutError(f"Drone {did}: MAVLink init sequence timed out.")
-        controller.start_rc_keepalive()
-        t0 = time.time()
-        while time.time() - t0 < float(position_timeout_s):
-            if controller.get_position() is not None:
+
+        if not _wait_for_position_stream(controller, timeout_s=float(position_timeout_s)):
+            raise TimeoutError(f"Drone {did}: no fresh SIM_STATE position stream before arm.")
+        if not _wait_for_position_estimate(
+            controller,
+            timeout_s=float(INIT_POSITION_ESTIMATE_TIMEOUT_SEC),
+        ):
+            raise TimeoutError(
+                f"Drone {did}: no EKF LOCAL_POSITION_NED estimate before arm."
+            )
+
+        init_deadline = time.time() + float(INIT_TOTAL_TIMEOUT_SEC)
+        takeoff_confirmed = False
+        attempt = 0
+        while time.time() < init_deadline and not takeoff_confirmed:
+            attempt += 1
+            logger.info("[fntena_logic_copy2] Drone %s init attempt %s", did, attempt)
+            if not _wait_for_position_estimate(controller, timeout_s=5.0):
+                logger.warning(
+                    "[fntena_logic_copy2] Drone %s position estimate not ready before attempt %s",
+                    did,
+                    attempt,
+                )
+                continue
+            steps = [
+                {"type": "set_mode", "mode_id": 4},  # GUIDED
+                {"type": "sleep", "sec": 1.0},
+                {"type": "arm"},
+                {"type": "sleep", "sec": 2.0},
+                {"type": "takeoff", "alt_m": float(INIT_TAKEOFF_ALT_M)},
+            ]
+            if not controller.initialize(steps):
+                raise TimeoutError(f"Drone {did}: MAVLink init command queue timed out.")
+            remaining = max(0.0, init_deadline - time.time())
+            wait_s = min(float(INIT_TAKEOFF_CONFIRM_TIMEOUT_SEC), remaining)
+            if wait_s > 0.0 and _wait_for_takeoff_alt(controller, float(INIT_TAKEOFF_ALT_M), timeout_s=wait_s):
+                takeoff_confirmed = True
                 break
-            time.sleep(0.1)
-        else:
-            raise TimeoutError("No SIM_STATE position after initialization")
+            logger.warning(
+                "[fntena_logic_copy2] Drone %s takeoff not confirmed after attempt %s",
+                did,
+                attempt,
+            )
+
+        if not takeoff_confirmed:
+            raise TimeoutError(
+                f"Drone {did}: takeoff to {INIT_TAKEOFF_ALT_M:.1f} m was not confirmed; "
+                "aborting scenario before control loop."
+            )
+
+        poshold_steps = [
+            {"type": "set_mode", "mode_id": 16},  # POSHOLD
+            {"type": "sleep", "sec": 1.0},
+            {"type": "set_mode", "mode_id": 16},  # POSHOLD retry
+            {
+                "type": "rc_override",
+                "chan1": RC_NEUTRAL,
+                "chan2": RC_NEUTRAL,
+                "chan3": RC_NEUTRAL,
+                "chan4": RC_NEUTRAL,
+            },
+            {"type": "sleep", "sec": 0.3},
+        ]
+        if not controller.initialize(poshold_steps):
+            raise TimeoutError(f"Drone {did}: POSHOLD/neutral RC sequence timed out.")
+
+        controller.start_rc_keepalive()
         init_barrier.wait(timeout=float(barrier_timeout_sec))
     except Exception:
         try:
@@ -409,7 +526,6 @@ def _control_loop(
     if controller.worker is None:
         return
 
-    roll_pid, pitch_pid = _pid_xy()
     z_sigma_pid = _pid_z_sigma(float(z_pwm_max))
 
     while True:
@@ -464,22 +580,21 @@ def _control_loop(
             r_vis=float(r_vis_m),
         )
 
-        _, _, sigma_z = _sigma_from_distances(distances, (vx, vy, vz))
-        sigma_x = _deadband(ax - mx, XY_DEADBAND_M)
-        sigma_y = _deadband(ay - my, XY_DEADBAND_M)
+        sigma_x, sigma_y, sigma_z = _sigma_from_distances(distances, (vx, vy, vz))
 
-        # Convention aligned with previous scenario:
+        # X/Y use normalized controls from neighbor sigma, then
+        # linear RC scaling [-1, 1] -> [1100, 1900].
         # pitch affects +x, roll affects +y; throttle affects -z (altitude up is -z).
-        pitch_out = pitch_pid.update(sigma_x, dt=CONTROL_DT)
-        roll_out = roll_pid.update(sigma_y, dt=CONTROL_DT)
+        u_x = _xy_unit_from_sigma(sigma_x)
+        u_y = _xy_unit_from_sigma(sigma_y)
 
         # For throttle: sigma_z is grid_antenna-like and includes NED vz damping.
         # A PI layer converts persistent sigma error into enough RC authority for POSHOLD.
         sigma_z_ctrl = _deadband(sigma_z, Z_SIGMA_DEADBAND)
         thr_delta = int(round(z_sigma_pid.update(sigma_z_ctrl, dt=CONTROL_DT)))
 
-        pitch = _clamp_rc(RC_NEUTRAL - int(pitch_out))
-        roll = _clamp_rc(RC_NEUTRAL + int(roll_out))
+        pitch = _unit_to_pwm(u_x, invert=True)
+        roll = _unit_to_pwm(u_y)
         throttle = _clamp_rc(RC_NEUTRAL + int(thr_delta))
 
         # Anchor drone: keep fixed horizontal position and altitude target to act as pacemaker.
@@ -517,7 +632,7 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    parser = argparse.ArgumentParser(description="fntena_logic_copy2: PID XY anchor-column lock with grid_antenna-like Z control in SITL")
+    parser = argparse.ArgumentParser(description="fntena_logic_copy2: grid_antenna-like XYZ neighbor sigma control in SITL")
     parser.add_argument("--drones", type=int, default=4)
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--heartbeat-timeout", type=float, default=12.0)
@@ -526,8 +641,8 @@ def main() -> None:
 
     parser.add_argument("--r-vis", type=float, default=R_VIS_M)
     parser.add_argument("--w", type=float, default=W_SPACING_M)
-    parser.add_argument("--xy-pwm-max", type=int, default=XY_PWM_MAX)
-    parser.add_argument("--xy-pwm-min-step", type=int, default=XY_PWM_MIN_STEP)
+    parser.add_argument("--xy-pwm-max", type=int, default=XY_PWM_MAX, help="Deprecated legacy option; ignored for X/Y.")
+    parser.add_argument("--xy-pwm-min-step", type=int, default=XY_PWM_MIN_STEP, help="Deprecated legacy option; ignored for X/Y.")
     parser.add_argument("--z-pwm-max", type=int, default=Z_PWM_MAX)
     parser.add_argument("--z-pwm-min-step", type=int, default=Z_PWM_MIN_STEP)
 
@@ -574,7 +689,7 @@ def main() -> None:
         ).start()
 
     try:
-        init_barrier.wait(timeout=75.0)
+        init_barrier.wait(timeout=float(INIT_BARRIER_TIMEOUT_SEC))
     except threading.BrokenBarrierError:
         logger.error("[fntena_logic_copy2] Init barrier broken; stopping.")
         _stop_all(controllers)
@@ -614,22 +729,22 @@ def main() -> None:
             "anchor_id": anchor_id,
             "log_hz": float(args.log_hz),
             "log_mode": str(args.log_mode),
-            "xy_output_limit": float(XY_OUTPUT_LIMIT),
-            "xy_deadband_m": float(XY_DEADBAND_M),
-            "xy_roll_kp": float(XY_ROLL_KP),
-            "xy_roll_ki": float(XY_ROLL_KI),
-            "xy_roll_kd": float(XY_ROLL_KD),
-            "xy_roll_integral_limit": float(XY_ROLL_INTEGRAL_LIMIT),
-            "xy_pitch_kp": float(XY_PITCH_KP),
-            "xy_pitch_ki": float(XY_PITCH_KI),
-            "xy_pitch_kd": float(XY_PITCH_KD),
-            "xy_pitch_integral_limit": float(XY_PITCH_INTEGRAL_LIMIT),
+            "xy_mapping": "unit_to_pwm_1100_1900",
+            "rc_min": int(RC_MIN),
+            "rc_max": int(RC_MAX),
+            "xy_missing_neighbor_distance_m": 0.0,
+            "xy_anchor_direction_fill": False,
+            "xy_pwm_max": int(args.xy_pwm_max),
+            "xy_pwm_min_step": int(args.xy_pwm_min_step),
+            "xy_sigma_deadband": float(XY_SIGMA_DEADBAND),
             "z_pwm_max": int(args.z_pwm_max),
             "z_pwm_min_step": int(args.z_pwm_min_step),
             "z_sigma_deadband": float(Z_SIGMA_DEADBAND),
             "z_sigma_kp": float(Z_SIGMA_KP),
             "z_sigma_ki": float(Z_SIGMA_KI),
             "z_sigma_integral_limit": float(Z_SIGMA_INTEGRAL_LIMIT),
+            "init_position_estimate_timeout_sec": float(INIT_POSITION_ESTIMATE_TIMEOUT_SEC),
+            "init_barrier_timeout_sec": float(INIT_BARRIER_TIMEOUT_SEC),
             "bootstrap_alt_separation_sec": float(BOOTSTRAP_ALT_SEPARATION_SEC),
             "bootstrap_base_pwm": int(BOOTSTRAP_BASE_PWM),
             "bootstrap_step_pwm": int(BOOTSTRAP_STEP_PWM),

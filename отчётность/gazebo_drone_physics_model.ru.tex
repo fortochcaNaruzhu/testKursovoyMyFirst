@@ -1,0 +1,1797 @@
+% Математическая модель мультикоптера в Gazebo Sim (gz-sim).
+% Сборка: pdflatex gazebo_drone_physics_model.ru.tex
+%
+% Источники:
+%   https://github.com/gazebosim/gz-sim
+%   MulticopterMotorModel.cc, LiftDrag.cc, Physics.cc
+%   DART (движок по умолчанию), SDFormat 1.11
+
+\documentclass[a4paper,11pt]{article}
+
+\usepackage[T2A]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[russian]{babel}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{bm}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\setlist{nosep,leftmargin=*}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\vect}[1]{\bm{#1}}
+\newcommand{\mat}[1]{\bm{#1}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+
+\title{Математическая модель мультикоптера\\
+в симуляторе Gazebo Sim (\code{gz-sim})}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Документ описывает физическую и математическую модель квадрокоптера
+в \textbf{Gazebo Sim} (\code{gz-sim}) и сопоставляет её с моделью
+\textbf{ArduPilot SITL}, используемой в проекте \code{Drone\_Swarm\_Simulator\_v2}.
+Даны уравнения движка \textbf{DART} (обобщённые координаты, матрица масс,
+алгоритм ABA, LCP для контактов), полная цепочка обнаружения столкновений
+(broadphase, GJK, EPA, mesh/convex hull), формулы контактных сил и трения,
+модель ротора Gazebo и модель \code{SIM\_Motor} в SITL.
+Показано, что в Gazebo для тех же кинематических величин
+($\vect{p},\mat{R},\vect{v},\vect{\omega}$) решается существенно более
+тяжёлая система: многосвязное тело, неявная интеграция, сотни контактных
+ограничений при mesh-коллизиях, тогда как SITL в режиме \code{SITL-only}
+интегрирует одно жёсткое тело без столкновений с окружением.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%====================================================================
+\section{Архитектура модели в Gazebo Sim}
+%====================================================================
+
+Gazebo Sim --- это симулятор робототехники, в котором динамика вычисляется
+\textbf{физическим движком} (по умолчанию \textbf{DART} из пакета
+\code{gz-physics}), а специализированные эффекты (двигатели, подъёмная сила
+крыльев, ветер) добавляются \textbf{системными плагинами} (\emph{systems}).
+
+Для типичного квадрокоптера (пример \code{examples/worlds/quadcopter.sdf})
+цепочка выглядит так:
+\begin{enumerate}
+  \item \textbf{SDF-модель} задаёт геометрию, массу, инерцию, сочленения
+  (joints), коллизионные формы и параметры поверхности.
+  \item \textbf{Physics system} (\code{gz-sim-physics-system}) создаёт
+  в DART скелет (\emph{skeleton}) из звеньев (\emph{links}) и суставов,
+  включает гравитацию, интегрирует уравнения движения.
+  \item На каждый ротор вешается \textbf{MulticopterMotorModel} --- по
+  команде угловой скорости вычисляет тягу, реактивный момент и
+  поперечное сопротивление винта; прикладывает силы/моменты к звеньям.
+  \item Опционально: \textbf{MulticopterVelocityControl} (высокоуровневый
+  закон скорости), \textbf{LiftDrag} (аэродинамика корпуса/крыльев),
+  \textbf{Wind} (поле ветра).
+  \item При пересечении коллизионных оболочек DART формирует
+  \textbf{контактные ограничения}; решатель LCP выдаёт импульсы,
+  предотвращающие проникновение и учитывающие трение.
+\end{enumerate}
+
+\paragraph{Связь с проектом Kursov3.}
+В текущем репозитории \code{Drone\_Swarm\_Simulator\_v2} для полётной
+динамики используется связка \textbf{ArduPilot SITL + Webots}, а не Gazebo.
+Тем не менее Gazebo Sim --- стандартная среда для SITL с плагином
+\code{ardupilot\_gazebo}; математическая структура модели (жёсткое тело +
+квадратичная тяга роторов) совпадает с классической схемой PX4/Rotors/Gazebo.
+
+%====================================================================
+\section{Что такое SDF}
+\label{sec:sdf}
+%====================================================================
+
+\textbf{SDF} (Simulation Description Format, \url{https://sdformat.org}) ---
+это XML-язык описания робота и мира для Gazebo.
+Файлы \code{*.sdf} --- не программа, а \textbf{паспорт модели}: откуда
+физический движок берёт массы, формы, суставы и параметры контакта.
+
+\subsection{Иерархия файла}
+
+Типичная структура:
+\begin{itemize}
+  \item \code{world} --- гравитация, освещение, физика (\code{physics}),
+  статические объекты (пол, стены);
+  \item \code{model} --- робот (дрон), состоит из \code{link} и \code{joint};
+  \item \code{link} --- одно \textbf{звено} (корпус, луч ротора, пропеллер);
+  \item \code{joint} --- \textbf{сустав} между двумя \code{link};
+  \item внутри \code{link}: \code{inertial}, \code{visual}, \code{collision}.
+\end{itemize}
+
+Gazebo при загрузке SDF строит дерево DART: каждый \code{link}
+$\to$ \code{BodyNode}, каждый \code{joint} $\to$ \code{Joint}.
+
+\subsection{Чем SDF отличается от URDF}
+
+URDF --- формат ROS; SDF --- родной для Gazebo, поддерживает мир,
+несколько моделей, мягкий контакт, плагины (\code{plugin}), ветер.
+Для дрона в Gazebo обычно один \code{model} с 5--9 \code{link}
+и 4--8 \code{joint}.
+
+\subsection{Что задаётся числами в SDF}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Блок SDF} & \textbf{Влияние на уравнения} \\
+\hline
+\code{inertial/mass}, \code{inertia} & $m$, $\mat{I}$ в \eqref{eq:newton} \\
+\code{collision/geometry} & форма для \eqref{eq:broadphase}--\eqref{eq:penetration} \\
+\code{surface/friction} & $\mu$ в \eqref{eq:coulomb} \\
+\code{surface/bounce} & $e$ в \eqref{eq:restitution} \\
+\code{joint/type} & число DOF в $\vect{q}$ \\
+\code{plugin MulticopterMotorModel} & $k_f$, $k_m$, $\tau_\uparrow$ \\
+\hline
+\end{tabular}
+\end{center}
+
+Без SDF симулятор не знает, \emph{какой} дрон считать: те же уравнения DART,
+но другие параметры и топология.
+
+%====================================================================
+\section{Системы координат и состояние}
+%====================================================================
+
+\subsection{Мировая система координат (World, ENU)}
+
+Gazebo по умолчанию использует правую декартову систему \textbf{ENU}
+(East--North--Up):
+\begin{itemize}
+  \item ось $X$ --- на восток, м;
+  \item ось $Y$ --- на север, м;
+  \item ось $Z$ --- вверх, м.
+\end{itemize}
+
+Положение центра масс (ЦМ) корпуса:
+\[
+  \vect{p} = (p_x, p_y, p_z)^\top \in \R^3.
+\]
+Ориентация задаётся кватернионом $\vect{q} = (q_w, q_x, q_y, q_z)^\top$
+или матрицей поворота $\mat{R}_{WB} \in SO(3)$ из связанной (body) системы
+в мировую.
+
+\subsection{Связанная система (Body)}
+
+Оси корпуса жёстко закреплены на раме дрона. Вектор силы тяги $i$-го
+ротора в локальной системе винта обычно направлен вдоль локальной оси $Z$
+(вверх относительно диска пропеллера). В мировую систему:
+\[
+  \vect{F}_{T,i}^W = \mat{R}_{WB}\,\mat{R}_{B i}\,
+  \begin{pmatrix} 0 \\ 0 \\ T_i \end{pmatrix},
+\]
+где $T_i$ --- скалярная тяга (Н), $\mat{R}_{B i}$ --- ориентация
+звена ротора относительно корпуса.
+
+\subsection{Полное состояние жёсткого тела (6-DOF)}
+
+Минимальный набор для интегратора DART:
+\begin{align*}
+  \text{положение ЦМ:} &\quad \vect{p}(t), \\
+  \text{ориентация:} &\quad \mat{R}_{WB}(t)\ \text{или}\ \vect{q}(t), \\
+  \text{линейная скорость (мир):} &\quad \vect{v}(t) = \dot{\vect{p}}, \\
+  \text{угловая скорость (связанная):} &\quad \vect{\omega}^B(t) \in \R^3.
+\end{align*}
+Эквивалентная форма Коши --- \textbf{12 скалярных уравнений первого порядка}
+(3+3+3+3).
+
+%====================================================================
+\section{Уравнения движения жёсткого тела}
+%====================================================================
+
+DART решает \textbf{уравнения Ньютона--Эйлера} для каждого звена,
+связанного с другими суставами или контактами.
+
+\subsection{Линейное движение}
+
+Сумма всех сил в мировой системе $\vect{F}^W$ даёт
+\begin{equation}
+  m\,\dot{\vect{v}} = \vect{F}^W
+  = \vect{F}_g + \sum_i \vect{F}_{T,i}^W + \sum_j \vect{F}_{\mathrm{drag},j}^W
+  + \vect{F}_{\mathrm{contact}} + \vect{F}_{\mathrm{ext}},
+  \label{eq:newton}
+\end{equation}
+где:
+\begin{itemize}
+  \item $m$ --- масса звена (кг), из SDF \code{inertial/mass};
+  \item $\vect{F}_g = m\vect{g}$ --- сила тяжести (Н);
+  \item $\vect{F}_{T,i}^W$ --- тяга $i$-го ротора (Н);
+  \item $\vect{F}_{\mathrm{drag},j}^W$ --- аэродинамическое сопротивление
+  (модель винта или \code{LiftDrag});
+  \item $\vect{F}_{\mathrm{contact}}$ --- контактная сила от DART (Н);
+  \item $\vect{F}_{\mathrm{ext}}$ --- прочие внешние силы (плагины).
+\end{itemize}
+
+\subsection{Вращательное движение}
+
+В связанной системе, относительно центра масс:
+\begin{equation}
+  \mat{I}^B \dot{\vect{\omega}}^B
+  + \vect{\omega}^B \times (\mat{I}^B \vect{\omega}^B)
+  = \vect{\tau}^B,
+  \label{eq:euler}
+\end{equation}
+где:
+\begin{itemize}
+  \item $\mat{I}^B \in \R^{3\times 3}$ --- тензор инерции в связанных осях
+  (кг\,м$^2$);
+  \item $\vect{\omega}^B = (\omega_x,\omega_y,\omega_z)^\top$ --- угловая
+  скорость (рад/с);
+  \item $\vect{\tau}^B$ --- суммарный момент сил относительно ЦМ (Н\,м).
+\end{itemize}
+
+Момент складывается из:
+\begin{equation}
+  \vect{\tau}^B =
+  \sum_i \left(\vect{r}_i^B \times \vect{F}_{T,i}^B\right)
+  + \sum_i \vect{\tau}_{Q,i}^B
+  + \vect{\tau}_{\mathrm{drag}}^B
+  + \vect{\tau}_{\mathrm{contact}}^B,
+  \label{eq:torque_sum}
+\end{equation}
+где $\vect{r}_i^B$ --- плечо $i$-го ротора от ЦМ, $\vect{\tau}_{Q,i}^B$ ---
+реактивный (drag) момент пропеллера.
+
+\subsection{От ускорения к новому состоянию}
+
+На шаге $\Delta t$ DART использует \textbf{неявную (implicit) схему}
+с учётом ограничений (контакты, суставы). В упрощённом виде (без контактов):
+\begin{align}
+  \vect{v}(t+\Delta t) &= \vect{v}(t) + \dot{\vect{v}}\,\Delta t,
+  \label{eq:vel_int}\\
+  \vect{p}(t+\Delta t) &= \vect{p}(t) + \vect{v}(t+\Delta t)\,\Delta t,
+  \label{eq:pos_int}\\
+  \dot{\mat{R}}_{WB} &= \mat{R}_{WB}\,[\vect{\omega}^B]_\times,
+  \label{eq:rot_kin}
+\end{align}
+где $[\vect{a}]_\times$ --- кососимметрическая матрица:
+\[
+  [\vect{a}]_\times =
+  \begin{pmatrix}
+    0 & -a_z & a_y \\
+    a_z & 0 & -a_x \\
+    -a_y & a_x & 0
+  \end{pmatrix}.
+\]
+
+\textbf{Цепочка вывода:}
+команда ротора $\Omega_i^{\mathrm{ref}}$
+$\Rightarrow$ фильтр $\Rightarrow$ $\omega_i$
+$\Rightarrow$ тяга $T_i$
+$\Rightarrow$ $\vect{F}, \vect{\tau}$
+$\Rightarrow$ \eqref{eq:newton}, \eqref{eq:euler}
+$\Rightarrow$ $\dot{\vect{v}}, \dot{\vect{\omega}}$
+$\Rightarrow$ \eqref{eq:vel_int}--\eqref{eq:rot_kin}
+$\Rightarrow$ новое $(\vect{p}, \mat{R}, \vect{v}, \vect{\omega})$.
+
+%====================================================================
+\section{Движок DART: обобщённые координаты и динамика}
+%====================================================================
+
+Gazebo Sim по умолчанию передаёт динамику библиотеке \textbf{DART}
+(Dynamic Animation and Robotics Toolkit, \url{https://github.com/dartsim/dart}).
+В отличие от SITL, где состояние --- одно жёсткое тело, DART описывает
+\textbf{скелет} (\emph{skeleton}) --- дерево звеньев (\code{BodyNode}),
+соединённых суставами (\code{Joint}) с обобщёнными координатами $\vect{q}$.
+
+\subsection{Обобщённые координаты и степени свободы}
+
+Для квадрокоптера в SDF типична структура:
+\begin{itemize}
+  \item корпус (\code{base\_link}) --- 6 DOF относительно мира
+  (если \code{free joint}) или 0 DOF (если закреплён);
+  \item 4 ротора --- по 1 DOF (\code{revolute joint}) на каждый винт.
+\end{itemize}
+Вектор обобщённых координат:
+\[
+  \vect{q} =
+  \bigl(
+    \vect{p}^\top,\ \vect{\eta}^\top,\ \theta_0,\ldots,\theta_{n-1}
+  \bigr)^\top,
+\]
+где $\vect{\eta}$ --- параметры ориентации корпуса (кватернион или углы),
+$\theta_i$ --- углы поворота суставов роторов.
+Скорости $\dot{\vect{q}} = \vect{u}$; ускорения $\ddot{\vect{q}} = \vect{a}$.
+
+\subsection{Уравнения динамики в обобщённых координатах}
+
+DART записывает динамику скелета в форме Лагранжа:
+\begin{equation}
+  \mat{M}(\vect{q})\,\ddot{\vect{q}}
+  + \vect{C}(\vect{q},\dot{\vect{q}})
+  + \vect{G}(\vect{q})
+  = \vect{\tau} + \vect{\tau}_{\mathrm{ext}} + \vect{J}_c^\top \vect{\lambda},
+  \label{eq:dart_eom}
+\end{equation}
+где:
+\begin{itemize}
+  \item $\mat{M}(\vect{q}) \in \R^{n\times n}$ --- \textbf{матрица обобщённых масс}
+  (кг\,м$^2$ или эквивалентные единицы по DOF);
+  \item $\vect{C}$ --- вектор кориолисовых и центробежных сил;
+  \item $\vect{G}$ --- обобщённые силы тяжести;
+  \item $\vect{\tau}$ --- управляющие моменты/силы суставов (от моторов);
+  \item $\vect{\tau}_{\mathrm{ext}}$ --- внешние силы (плагины Gazebo);
+  \item $\vect{J}_c$ --- якобиан контактных/кинематических ограничений;
+  \item $\vect{\lambda}$ --- множители Лагранжа (импульсы контактов).
+\end{itemize}
+
+\paragraph{Связь с Ньютоном--Эйлером.}
+Для одного звена \eqref{eq:dart_eom} эквивалентна
+\eqref{eq:newton}--\eqref{eq:euler}, но $\mat{M}$, $\vect{C}$, $\vect{G}$
+собираются с учётом кинематической цепи (плеч роторов, вращающихся звеньев).
+
+\subsection{Алгоритм ABA (Featherstone)}
+
+Без контактов DART вычисляет ускорения за $O(n)$ операций
+(\emph{Articulated Body Algorithm}):
+\begin{equation}
+  \ddot{\vect{q}} =
+  \mat{M}(\vect{q})^{-1}
+  \bigl(
+    \vect{\tau} + \vect{\tau}_{\mathrm{ext}}
+    - \vect{C}(\vect{q},\dot{\vect{q}})
+    - \vect{G}(\vect{q})
+  \bigr).
+  \label{eq:aba}
+\end{equation}
+Два прохода по дереву звеньев:
+\begin{enumerate}
+  \item \textbf{от листьев к корню} --- накопление инерции сочленённого тела;
+  \item \textbf{от корня к листьям} --- распространение ускорений.
+\end{enumerate}
+
+\subsection{Матрица масс и обратная динамика}
+
+Матрица $\mat{M}$ может строиться алгоритмом CRBA
+(\emph{Composite Rigid Body Algorithm}, сложность $O(n^2)$).
+Обратная динамика (RNEA) по заданному $\ddot{\vect{q}}$ даёт необходимый $\vect{\tau}$.
+
+\subsection{Пассивные силы суставов}
+
+Каждый \code{Joint} в DART может иметь:
+\begin{equation}
+  \tau_j^{\mathrm{passive}} =
+  -k_j (q_j - q_{j,0})
+  - d_j \dot{q}_j
+  - f_j \,\sgn(\dot{q}_j),
+  \label{eq:joint_passive}
+\end{equation}
+где $k_j$ --- жёсткость, $d_j$ --- демпфирование, $f_j$ --- сухое трение.
+В SDF задаётся через \code{physics/dart} или параметры сустава.
+
+\subsection{Полный шаг \code{World::step()} в DART}
+
+По документации архитектуры DART (\code{docs/onboarding/architecture.md}):
+\begin{enumerate}
+  \item \textbf{Прямая кинематика:}
+  $\vect{q} \Rightarrow$ положения/скорости всех \code{BodyNode};
+  \item \textbf{Прямая динамика (ABA):} $\ddot{\vect{q}}_{\mathrm{free}}$
+  из \eqref{eq:aba} без контактов;
+  \item \textbf{ConstraintSolver::solve():}
+  \begin{enumerate}
+    \item collision detection $\Rightarrow$ контакты;
+    \item построение \code{ContactConstraint}, лимитов суставов;
+    \item сбор boxed LCP; решение (Dantzig / PGS);
+    \item применение импульсов:
+    $\vect{v}_{n+1} = \vect{v}_n + \mat{M}^{-1}\vect{J}_c^\top \vect{\lambda}$.
+  \end{enumerate}
+  \item \textbf{Интеграция (semi-implicit Euler):}
+  \begin{align}
+    \dot{\vect{q}}_{n+1} &= \dot{\vect{q}}_n + \ddot{\vect{q}}_n\,\Delta t,
+    \label{eq:dart_vel}\\
+    \vect{q}_{n+1} &= \vect{q}_n + \dot{\vect{q}}_{n+1}\,\Delta t.
+    \label{eq:dart_pos}
+  \end{align}
+\end{enumerate}
+
+\paragraph{Отличие от SITL.}
+SITL использует \textbf{явный} Эйлер для скорости и положения
+(см.\ раздел~\ref{sec:sitl}); DART --- \textbf{полунеявный} Эйлер
+\eqref{eq:dart_vel}--\eqref{eq:dart_pos} \emph{после} решения LCP,
+что стабильнее при жёстких контактах.
+
+%====================================================================
+\section{Масса, центр масс и инерция (SDF)}
+%====================================================================
+
+В файле SDF для каждого \code{link} задаётся блок \code{inertial}:
+
+\begin{itemize}
+  \item \code{mass} --- $m$ (кг);
+  \item \code{pose} --- смещение и поворот ЦМ относительно звена;
+  \item \code{inertia} --- компоненты симметричного тензора
+  $I_{xx}, I_{xy}, I_{xz}, I_{yy}, I_{yz}, I_{zz}$.
+\end{itemize}
+
+Матрица инерции в системе, заданной в SDF:
+\[
+  \mat{I} =
+  \begin{pmatrix}
+    I_{xx} & I_{xy} & I_{xz} \\
+    I_{xy} & I_{yy} & I_{yz} \\
+    I_{xz} & I_{yz} & I_{zz}
+  \end{pmatrix}.
+\]
+
+Если оси SDF не совпадают с главными осями инерции, DART переносит
+$\mat{I}$ в мировую/связанную систему через теорему Штейнера:
+\begin{equation}
+  \mat{I}^B = \mat{R}\,\mat{I}_{\mathrm{SDF}}\,\mat{R}^\top,
+  \qquad
+  \mat{I}_{\mathrm{parallel}} = \mat{I}_C + m\bigl(\norm{\vect{r}}^2\mat{E}
+  - \vect{r}\vect{r}^\top\bigr),
+  \label{eq:steiner}
+\end{equation}
+где $\vect{r}$ --- вектор от старого центра к новому, $\mat{E}$ --- единичная
+матрица.
+
+\paragraph{Практика для дрона.}
+Корпус моделируют одним или несколькими звеньями; роторы --- отдельными
+звеньями с малыми массами, соединёнными \code{revolute joint} (ось вращения
+пропеллера). Суммарная масса и инерция всего аппарата --- результат
+композиции всех звеньев в дереве кинематики DART.
+
+%====================================================================
+\section{Сила тяжести}
+%====================================================================
+
+В SDF мира (\code{world/physics/gravity}) задаётся вектор
+\[
+  \vect{g} = (g_x, g_y, g_z)^\top,
+\]
+по умолчанию $\vect{g} = (0,\,0,\,-9.80665)^\top$ м/с$^2$ в ENU
+(направлен \emph{вниз}, т.\,е.\ отрицательная $Z$).
+
+Сила тяжести на звено:
+\begin{equation}
+  \vect{F}_g = m\,\vect{g}.
+  \label{eq:gravity}
+\end{equation}
+
+Physics system читает компонент \code{Gravity} и передаёт $\vect{g}$ в
+движок (\code{world.SetGravity(...)}). Для отдельного звена гравитацию
+можно отключить (\code{gravity\_enabled=false}), но для дрона она включена.
+
+%====================================================================
+\section{Модель одного двигателя: MulticopterMotorModel}
+%====================================================================
+
+Системный плагин \code{gz::sim::systems::MulticopterMotorModel}
+(исходник \code{src/systems/multicopter\_motor\_model/}) реализует
+классическую модель из пакета Rotors/PX4 (Furrer et al., ETH; далее
+Martin \& Salaün, ICRA 2010 для поперечного потока).
+
+\subsection{Вход: команда угловой скорости}
+
+На топик \code{commandSubTopic} (например \code{gazebo/command/motor\_speed})
+приходит сообщение \code{Actuators} с массивом \code{velocity}.
+Для ротора с индексом \code{actuator\_number} $= i$:
+\begin{equation}
+  \Omega_i^{\mathrm{ref}} =
+  \min\bigl(\code{velocity}[i],\,\Omega_{\max}\bigr),
+  \qquad
+  \Omega_{\max} = \code{maxRotVelocity}\ \text{рад/с}.
+  \label{eq:ref_input}
+\end{equation}
+
+\subsection{Фильтр первого порядка (инерция ESC+мотор)}
+
+Реальная скорость ротора не мгновенна. Применяется дискретный фильтр
+с разными постоянными времени на разгон и торможение
+(\code{timeConstantUp}, \code{timeConstantDown}):
+\begin{equation}
+  \Omega_i[k+1] =
+  \begin{cases}
+    e^{-\Delta t/\tau_\uparrow}\,\Omega_i[k]
+    + \bigl(1-e^{-\Delta t/\tau_\uparrow}\bigr)\,\Omega_i^{\mathrm{ref}},
+    & \Omega_i^{\mathrm{ref}} > \Omega_i[k], \\[6pt]
+    e^{-\Delta t/\tau_\downarrow}\,\Omega_i[k]
+    + \bigl(1-e^{-\Delta t/\tau_\downarrow}\bigr)\,\Omega_i^{\mathrm{ref}},
+    & \text{иначе}.
+  \end{cases}
+  \label{eq:motor_filter}
+\end{equation}
+Параметры:
+\begin{itemize}
+  \item $\Delta t$ --- шаг симуляции, с;
+  \item $\tau_\uparrow = \code{timeConstantUp}$, $\tau_\downarrow =
+  \code{timeConstantDown}$, с;
+  \item $\Omega_i$ --- отфильтрованная угловая скорость, рад/с.
+\end{itemize}
+
+Непрерывный аналог: $ \dot{\Omega} = (\Omega^{\mathrm{ref}}-\Omega)/\tau$.
+
+\subsection{Связь с joint и параметр slowdown}
+
+Чтобы избежать численных проблем, \emph{скорость сустава} в DART
+уменьшается в \code{rotorVelocitySlowdownSim} $= n_s$ раз (типично $n_s=10$):
+\begin{equation}
+  \omega_i^{\mathrm{joint}} = \frac{\sigma_i\,\Omega_i}{n_s},
+  \label{eq:joint_vel}
+\end{equation}
+где $\sigma_i \in \{+1,-1\}$ --- \code{turningDirection}
+(\code{cw} $\Rightarrow -1$, \code{ccw} $\Rightarrow +1$).
+
+Для расчёта тяги используется \emph{полная} скорость:
+\begin{equation}
+  \omega_i^{\mathrm{real}} = \omega_i^{\mathrm{joint}}\, n_s
+  = \sigma_i\,\Omega_i.
+  \label{eq:real_vel}
+\end{equation}
+Т.\,е.\ $n_s$ сокращается: тяга зависит от $\Omega_i$, а не от
+завышенной joint-скорости.
+
+\subsection{Тяга одного ротора}
+
+\begin{equation}
+  T_i = \sigma_i\,\sgn(\omega_i^{\mathrm{real}})\,
+  \bigl(\omega_i^{\mathrm{real}}\bigr)^2\, k_f,
+  \qquad
+  k_f = \code{motorConstant}\ \ \text{Н/(рад/с)}^2.
+  \label{eq:thrust}
+\end{equation}
+
+Физический смысл: $T \propto \omega^2$ --- упрощённая модель
+несущего винта (аналог $T \propto n^2$ для об/мин).
+Сила прикладывается к звену ротора вдоль его локальной $Z$ в мировой
+системе:
+\[
+  \vect{F}_{T,i}^W = \mat{R}_{\mathrm{rotor},i}\,
+  \begin{pmatrix}0\\0\\T_i\end{pmatrix}.
+\]
+
+\subsection{Реактивный момент (drag torque)}
+
+Момент сопротивления вращению пропеллера (от тяги):
+\begin{equation}
+  \vect{\tau}_{Q,i}^{\mathrm{rotor}} =
+  \begin{pmatrix} 0 \\ 0 \\ -\sigma_i\, T_i\, k_m \end{pmatrix},
+  \qquad
+  k_m = \code{momentConstant}\ \ \text{м},
+  \label{eq:drag_torque}
+\end{equation}
+затем переносится в систему родительского звена (корпуса) и в мир.
+
+\subsection{Поперечное сопротивление винта (blade flapping proxy)}
+
+По Martin \& Salaün (2010), с учётом ветра (\code{Wind}):
+\begin{align}
+  \vect{v}_{\mathrm{rel}}^W &= \vect{v}_{\mathrm{link}}^W - \vect{v}_{\mathrm{wind}}^W,
+  \label{eq:vrel}\\
+  \vect{v}_\perp &= \vect{v}_{\mathrm{rel}}^W
+  - (\vect{v}_{\mathrm{rel}}^W \cdot \vect{e}_\omega)\,\vect{e}_\omega,
+  \label{eq:vperp}\\
+  \vect{F}_{\mathrm{blade},i}^W} &=
+  -\abs{\omega_i^{\mathrm{real}}}\, b_f\,\vect{v}_\perp,
+  \label{eq:blade_drag}
+\end{align}
+где $\vect{e}_\omega$ --- ось вращения ротора в мировой системе,
+$b_f = \code{rotorDragCoefficient}$ (Н/(м/с)$^2$ в документации кода).
+
+\subsection{Rolling moment}
+
+Дополнительный момент от поперечного потока:
+\begin{equation}
+  \vect{\tau}_{\mathrm{roll},i}^W =
+  -\abs{\omega_i^{\mathrm{real}}}\,\mu_1\,\vect{v}_\perp,
+  \qquad
+  \mu_1 = \code{rollingMomentCoefficient}.
+  \label{eq:rolling}
+\end{equation}
+
+\subsection{Сводка по одному двигателю}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Параметр SDF} & \textbf{Символ} & \textbf{Единица} \\
+\hline
+\code{motorConstant} & $k_f$ & Н/(рад/с)$^2$ \\
+\code{momentConstant} & $k_m$ & м \\
+\code{maxRotVelocity} & $\Omega_{\max}$ & рад/с \\
+\code{rotorDragCoefficient} & $b_f$ & см. код \\
+\code{rollingMomentCoefficient} & $\mu_1$ & см. код \\
+\code{timeConstantUp/Down} & $\tau_\uparrow, \tau_\downarrow$ & с \\
+\code{rotorVelocitySlowdownSim} & $n_s$ & --- \\
+\code{turningDirection} & $\sigma_i$ & $\pm 1$ \\
+\hline
+\end{tabular}
+\end{center}
+
+%====================================================================
+\section{Полная модель квадрокоптера}
+%====================================================================
+
+\subsection{Геометрия X-конфигурации}
+
+Для 4 роторов (пример X3 в \code{quadcopter.sdf}) индексы $i=0,1,2,3$.
+Роторы 0 и 1 --- \code{ccw}, 2 и 3 --- \code{cw} (или наоборот),
+чтобы суммарный реактивный момент мог компенсироваться.
+
+Плечо ротора $\vect{r}_i^B = (r_{x,i}, r_{y,i}, 0)^\top$ --- расстояние
+от ЦМ до оси $i$-го винта в плоскости рамы.
+
+\subsection{Суммарная тяга и моменты}
+
+\begin{align}
+  T_{\Sigma} &= \sum_{i=0}^{3} T_i,
+  \label{eq:total_thrust}\\
+  \vect{F}_T^W &= \sum_{i=0}^{3} \vect{F}_{T,i}^W,
+  \label{eq:total_force}\\
+  \vect{\tau}^B &= \sum_{i=0}^{3}
+  \vect{r}_i^B \times
+  \begin{pmatrix}0\\0\\T_i\end{pmatrix}
+  + \sum_{i=0}^{3} \vect{\tau}_{Q,i}^B
+  + \sum_{i=0}^{3} \vect{\tau}_{\mathrm{roll},i}^B
+  + \vect{\tau}_{\mathrm{ext}}^B.
+  \label{eq:total_torque}
+\end{align}
+
+В \emph{идеализированной} модели (без $\vect{v}_\perp$, одинаковые $T_i$):
+\begin{itemize}
+  \item вертикальный подъём: $T_{\Sigma} \approx mg$ в висении;
+  \item крен: разность тяг левых/правых роторов создаёт $\tau_x$;
+  \item тангаж: разность передних/задних --- $\tau_y$;
+  \item рыскание: разность $\sigma_i T_i k_m$ --- $\tau_z$
+  (компensation yaw).
+\end{itemize}
+
+\subsection{MulticopterVelocityControl (опционально)}
+
+Плагин \code{MulticopterVelocityControl} по желаемой линейной скорости
+и yaw-rate в связанной системе решает обратную задачу и выдаёт
+$\Omega_i^{\mathrm{ref}}$ в компонент \code{Actuators}. Сами по себе
+силы он не прикладывает --- нужен \code{MulticopterMotorModel} на каждом
+роторе (см.\ API Gazebo Sim 10).
+
+%====================================================================
+\section{Суставы (\code{joint}) дрона в Gazebo}
+\label{sec:joints}
+%====================================================================
+
+В SDF сустав связывает \textbf{parent link} и \textbf{child link}.
+DART превращает тип joint в ограничения на относительное движение
+и добавляет соответствующие строки в $\vect{q}$.
+
+\subsection{Типовая кинематическая цепь квадрокоптера}
+
+Пример (модель X3 / iris-like):
+\begin{center}
+\begin{tabular}{c}
+\code{world} \\
+$\downarrow$ \code{free} или фикс. база \\
+\code{base\_link} (корпус) \\
+$\swarrow$ \code{revolute} $\times 4$ \\
+\code{rotor\_0..3} (звенья пропеллеров)
+\end{tabular}
+\end{center}
+
+\subsection{Типы суставов и число DOF}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{|l|c|l|}
+\hline
+\textbf{SDF \code{joint type}} & \textbf{DOF} & \textbf{Роль на дроне} \\
+\hline
+\code{fixed} & 0 &
+луч жёстко к корпусу (упрощённая модель без вращения винта) \\
+\code{revolute} & 1 &
+ось пропеллера: угол $\theta_i$, скорость $\dot{\theta}_i$
+(\code{MulticopterMotorModel} задаёт $\dot{\theta}_i$ через
+\eqref{eq:joint_vel}) \\
+\code{continuous} & 1 &
+как \code{revolute}, но без лимита $2\pi$ (полный оборот) \\
+\code{ball} & 3 & шаровой шарнир (редко на коптере) \\
+\code{free} & 6 &
+весь дрон как одно звено относительно мира
+($x,y,z$, roll, pitch, yaw) \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Уравнения для \code{revolute} (ротор)}
+
+Ось $\vect{e}_i$ в системе parent. Угол $\theta_i$ --- координата в $\vect{q}$.
+Кинематика:
+\begin{equation}
+  \mat{R}_{\mathrm{child}} =
+  \mat{R}_{\mathrm{parent}}\,\mat{R}_z(\theta_i),
+  \qquad
+  \dot{\mat{R}}_{\mathrm{child}} =
+  \mat{R}_{\mathrm{parent}}\,\mat{S}(\vect{e}_i)\,\dot{\theta}_i.
+  \label{eq:revolute_kin}
+\end{equation}
+DART добавляет в $\mat{M}(\vect{q})$ инерцию звена ротора и связь
+между $\ddot{\theta}_i$ и ускорением корпуса.
+
+Управление от плагина --- не момент $\tau_i$, а \textbf{скорость}:
+\begin{equation}
+  \dot{\theta}_i^{\mathrm{cmd}} =
+  \frac{\sigma_i\,\Omega_i}{n_s}
+  \quad \text{(\code{JointVelocityCmd})}.
+  \label{eq:joint_cmd}
+\end{equation}
+Тяга \eqref{eq:thrust} считается по $\Omega_i$, а не по реакции сустава.
+
+\subsection{Сустав \code{free} (весь дрон)}
+
+Если корпус соединён с миром через \code{free joint}:
+\[
+  \vect{q}_{\mathrm{body}} =
+  (x,y,z,\phi,\theta,\psi)^\top \ \text{или кватернион},
+\]
+6 DOF. Тогда \eqref{eq:dart_eom} описывает полёт целиком;
+роторы дают +4 DOF $\Rightarrow$ типично $n_q = 10$.
+
+Если корпус \textbf{приклеен} к миру (\code{fixed} к world) --- 0 DOF
+корпуса, только роторы крутятся (редко для полёта).
+
+\subsection{Пассивные и ограничивающие силы сустава}
+
+Из \eqref{eq:joint_passive} и лимитов:
+\begin{equation}
+  \tau_i^{\mathrm{limit}} =
+  \begin{cases}
+    \lambda_i \geq 0, & \theta_i = \theta_{\max}, \\
+    \lambda_i \leq 0, & \theta_i = \theta_{\min}.
+  \end{cases}
+\end{equation}
+Для \code{continuous} лимитов нет; для \code{revolute} с \code{limit}
+--- удар об упор при превышении угла.
+
+\subsection{Отличие от SITL}
+
+В SITL нет отдельных $\theta_i$ в состоянии: четыре мотора --- это
+алгебраические $T_i$, а не DOF дерева. Вращение пропеллера
+не интегрируется как $\dot{\theta}_i$; только $\vect{\omega}$ всего аппарата
+в \eqref{eq:sitl_omega}.
+
+%====================================================================
+\section{Дополнительная аэродинамика: LiftDrag}
+%====================================================================
+
+Для несущих поверхностей (крыло, фюзеляж) плагин \code{LiftDrag} добавляет
+силы в точке \code{cp} (center of pressure):
+\begin{align}
+  q &= \tfrac{1}{2}\rho \norm{\vect{v}_{\mathrm{plane}}}^2,
+  \quad \text{динамическое давление}, \label{eq:q}\\
+  \alpha &= \text{угол атаки в плоскости profile}, \\
+  C_L &= \code{cla}\cdot\alpha \ \text{(до stall)}, \\
+  C_D &= \abs{\code{cda}\cdot\alpha}, \\
+  \vect{F}_{\mathrm{lift}} &= C_L\, q\, S\,\vect{e}_{\mathrm{lift}}, \\
+  \vect{F}_{\mathrm{drag}} &= C_D\, q\, S\,(-\vect{e}_{\mathrm{drag}}),
+\end{align}
+где $\rho = \code{air\_density}$, $S = \code{area}$.
+Полная сила $\vect{F} = \vect{F}_{\mathrm{lift}}+\vect{F}_{\mathrm{drag}}$,
+момент $\vect{\tau} = \vect{\tau}_C + \vect{r}_{cp}\times\vect{F}$.
+
+Для классического квадрокоптера без крыльев этот плагин часто не
+используют; для гибридных VTOL --- обязателен.
+
+%====================================================================
+\section{Внутренние и внешние силы: классификация}
+%====================================================================
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|p{3.2cm}|p{4.5cm}|p{6.5cm}|}
+\hline
+\textbf{Тип} & \textbf{Источник в Gazebo} & \textbf{Физическая природа} \\
+\hline
+Внешняя &
+$\vect{F}_g$, ветер, контакт с землёй &
+Гравитация, среда, ограничение среды \\
+\hline
+Внутренняя (управление) &
+\code{MulticopterMotorModel} &
+Тяга и момент от пропеллеров \\
+\hline
+Внутренняя (диссипация) &
+\code{rotorDragCoefficient}, joint damping &
+Сопротивление потоку, трение в осях \\
+\hline
+Связь / constraint &
+DART joints, contacts &
+Идеальные кинематические связи, непроникновение \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{«Внутренние» силы} --- генерируются actuators модели (моторы).
+\paragraph{«Внешние»} --- действуют от окружения (гравитация, ветер, пол, стены).
+
+%====================================================================
+\section{Столкновения: геометрия, обнаружение, контактные силы}
+\label{sec:collision}
+%====================================================================
+
+В \textbf{ArduPilot SITL-only} (режим проекта Kursov3) столкновений
+с землёй и препятствиями \emph{нет}: высота не ограничена снизу физикой.
+В \textbf{Gazebo + DART} контакт --- обязательная часть каждого шага
+\code{World::step()}.
+
+\subsection{Что такое \code{link} в коллизии}
+
+\textbf{Link} (звено) --- это жёсткая часть модели с собственной системой
+координат, массой и (опционально) коллизией.
+В SDF:
+\begin{verbatim}
+<link name="base_link">
+  <inertial>...</inertial>
+  <visual>...</visual>      <!-- только картинка -->
+  <collision name="col_base"> <!-- только физика -->
+    <geometry><box>...</box></geometry>
+    <surface>...</surface>
+  </collision>
+</link>
+\end{verbatim}
+
+Важно:
+\begin{itemize}
+  \item \textbf{Коллизия привязана к link}, не к «дрону целиком».
+  У квадрокоптера могут быть отдельные \code{collision} на корпусе,
+  на лучах, на защитных ободах; у каждого --- свой \code{CollisionObject} в DART.
+  \item \code{visual} и \code{collision} \textbf{независимы}: можно рисовать
+  детальную сетку, а для физики использовать упрощённый box.
+  \item DART хранит форму на \code{ShapeNode}, висящем на \code{BodyNode}
+  данного link. При контакте силы прикладываются к \textbf{тому link},
+  чья форма пересеклась (через якобиан в \eqref{eq:lcp_A}).
+\end{itemize}
+
+Если дрон касается пола лучом и корпусом одновременно, в LCP появляются
+\textbf{две группы} контактов с разными $\vect{c}_k$ и разными звеньями
+в дереве --- отсюда «сложность mesh + несколько link».
+
+\subsection{Какой тип столкновения реально используется}
+
+В таблице ниже --- все типы \code{collision/geometry} в SDF.
+На практике для мультикоптера:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{Тип} & \textbf{Математика} & \textbf{Сложность} & \textbf{Где применяют} \\
+\hline
+\code{plane} &
+$\mathcal{P}=\{\vect{x}: \vect{n}^\top\vect{x}+d=0,\ \vect{n}^\top\vect{x}\geq 0\}$
+& низкая & пол мира, стены \\
+\code{box} &
+$\mathcal{B}=\{\vect{x}: |R^\top(\vect{x}-\vect{c})| \leq \vect{a}\}$
+& низкая & упрощённая рама, стол \\
+\code{sphere} &
+$\|\vect{x}-\vect{c}\|\leq r$ & низкая & сфера-прокси \\
+\code{cylinder} &
+радиус $r$, ось $\vect{e}$ & низкая & мачта, столб \\
+\code{mesh} (как есть) &
+$\bigcup_{\triangle} \mathrm{conv}\{v_{i_0},v_{i_1},v_{i_2}\}$
+& \textbf{высокая} & редко (нестабильно) \\
+\code{mesh}+\code{convex\_hull} &
+$\mathrm{conv}(\mathcal{V})$ & средняя & корпус iris \\
+\code{mesh}+\code{convex\_decomposition} &
+$\bigcup_k \mathrm{conv}(\mathcal{V}_k)$ & высокая & сложная рама \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{Почему не «сырой» mesh.}
+Невыпуклая сетка (вогнутые карманы под мотором) даёт множественные
+ложные контакты и нестабильный EPA. Поэтому Gazebo при загрузке часто
+\textbf{заменяет} mesh на выпуклую оболочку или набор выпуклых частей
+(V-HACD). Визуально дрон детальный, физически --- упрощённый полиэдр.
+
+\paragraph{Типичный выбор для посадки.}
+\begin{itemize}
+  \item \textbf{Земля:} \code{plane} --- аналитический контакт, 1--мало точек;
+  \item \textbf{Дрон:} \code{box} или \code{convex hull} корпуса;
+  \item \textbf{Пропеллеры:} часто \code{collision enabled=false}, чтобы
+  лопасти не цепляли воздух/землю ложными контактами.
+\end{itemize}
+
+\paragraph{Сетка (mesh) и выпуклая оболочка.}
+Исходный \code{.dae}/\code{.stl} содержит вершины
+$\mathcal{V}=\{\vect{v}_0,\ldots,\vect{v}_{N-1}\}$ и грани
+$\mathcal{F}=\{f_0,\ldots,f_{M-1}\}$.
+Для устойчивой физики Gazebo рекомендует не использовать произвольную
+невыпуклую сетку напрямую, а:
+\begin{enumerate}
+  \item \textbf{Convex hull} (\code{convex\_hull}): минимальная выпуклая
+  оболочка $\mathrm{conv}(\mathcal{V})$;
+  \item \textbf{Convex decomposition} (V-HACD, \code{convex\_decomposition}):
+  разбиение на $K$ выпуклых субмешей
+  $\mathcal{M}=\bigcup_{k=1}^{K} \mathrm{conv}(\mathcal{V}_k)$.
+\end{enumerate}
+Каждый субмеш --- отдельный \code{CollisionObject} в DART/FCL.
+
+\subsection{Двухфазное обнаружение столкновений}
+
+\subsubsection{Широкая фаза (broadphase) --- подробно}
+
+\textbf{Задача:} из $m$ коллизионных объектов (все \code{collision} всех
+\code{link} всех моделей + пол) найти пары, которые \emph{могут}
+пересекаться, не проверяя каждую пару точно ($O(m^2)$ дорого).
+
+\paragraph{Ограничивающий ящик AABB.}
+Для объекта $i$ в мировой системе:
+\begin{equation}
+  \mathrm{AABB}_i =
+  \bigl\{
+    \vect{x} :
+    x_{\min,i} \leq x \leq x_{\max,i},\;
+    y_{\min,i} \leq y \leq y_{\max,i},\;
+    z_{\min,i} \leq z \leq z_{\max,i}
+  \bigr\},
+  \label{eq:aabb}
+\end{equation}
+где границы берутся по всем точкам формы link в текущей позе
+(при повороте дрона AABB \textbf{расширяется}, становится больше реального тела).
+
+\paragraph{Тест пересечения AABB.}
+Два ящика пересекаются тогда и только тогда, когда по \emph{каждой} оси
+интервалы проекций перекрываются:
+\begin{equation}
+  \mathrm{AABB}_i \cap \mathrm{AABB}_j \neq \emptyset
+  \Leftrightarrow
+  \forall \alpha \in \{x,y,z\}:\;
+  \max(a_{\min,i}^{(\alpha)}, a_{\min,j}^{(\alpha)})
+  \leq
+  \min(a_{\max,i}^{(\alpha)}, a_{\max,j}^{(\alpha)}).
+  \label{eq:aabb_test}
+\end{equation}
+
+\paragraph{Множество кандидатов.}
+\begin{equation}
+  \mathcal{P}_{\mathrm{cand}} =
+  \bigl\{
+    (i,j) : i<j,\;
+    \mathrm{AABB}_i \cap \mathrm{AABB}_j \neq \emptyset,\;
+    \text{слои } i,j \text{ не исключены фильтром}
+  \bigr\}.
+  \label{eq:broadphase}
+\end{equation}
+Фильтр \code{collide\_bitmask} в SDF отключает, например, контакт
+«корпус--лопасть того же дрона».
+
+\paragraph{Ускорение: BVH / sweep-and-prune.}
+На каждом шаге $\Delta t$ позы меняются мало; используют дерево
+ограничивающих объёмов (BVH) или сортировку по оси
+(\emph{sweep-and-prune}): сложность порядка $O(m \log m)$--$O(m)$,
+а не $O(m^2)$.
+
+\paragraph{Связь с link.}
+Один \code{link} может иметь \textbf{несколько} \code{collision}
+(например, корпус + обод мотора) --- это \textbf{отдельные} объекты
+$i,j$ в broadphase. Поэтому число $m$ в формулах больше числа дронов.
+
+\subsubsection{Узкая фаза (narrowphase)}
+
+Для каждой пары $(i,j) \in \mathcal{P}_{\mathrm{cand}}$ вычисляется
+пересечение точных форм. В Gazebo (через FCL) для выпуклых тел
+применяется алгоритм \textbf{GJK} (Gilbert--Johnson--Keerthi).
+
+\paragraph{Минковское разностное множество.}
+Для тел $A$ и $B$:
+\begin{equation}
+  \mathcal{A} \ominus \mathcal{B} =
+  \{\vect{a} - \vect{b} \mid \vect{a}\in A,\ \vect{b}\in B\}.
+  \label{eq:minkowski}
+\end{equation}
+Тела пересекаются $\Leftrightarrow$ $\vect{0} \in \mathcal{A}\ominus\mathcal{B}$.
+
+GJK итеративно строит симплекс в $\mathcal{A}\ominus\mathcal{B}$,
+приближаясь к началу координат. Если найдено пересечение, вызывается
+\textbf{EPA} (Expanding Polytope Algorithm) для глубины проникновения:
+\begin{align}
+  \delta &= \min_{\vect{x}\in \partial(\mathcal{A}\ominus\mathcal{B})}
+  \norm{\vect{x}},
+  \label{eq:penetration}\\
+  \vect{n} &= \text{нормаль к ближайшей грани политопа EPA}.
+  \label{eq:contact_normal}
+\end{align}
+$\delta$ --- скалярная \textbf{глубина проникновения} (м);
+$\vect{n}$ --- единичная нормаль контакта (от $A$ к $B$).
+
+\paragraph{Контакт по треугольнику mesh.}
+Для пары «треугольник--выпуклый многогранник» FCL возвращает
+1--несколько точек $\vect{c}_k$, нормалей $\vect{n}_k$, глубин $\delta_k$.
+При mesh-посадке рамы возможны \textbf{десятки контактов} одновременно
+(ребро луча, угол корпуса, несколько треугольников подвеса).
+
+\subsection{Запись контакта в DART}
+
+После narrowphase для пары объектов $(i,j)$ формируется
+\textbf{структура контакта} (в Gazebo Classic --- до 250 точек на пару;
+в DART --- список произвольной длины, ограничиваемый \code{max\_contacts}).
+
+Для каждой точки контакта $k$:
+\begin{equation}
+  \mathcal{C}_k =
+  \bigl\{
+    \text{link}_A,\ \text{link}_B,\;
+    \vect{c}_k \in \R^3,\;
+    \vect{n}_k \in \R^3,\ \norm{\vect{n}_k}=1,\;
+    \delta_k \geq 0,\;
+    \vect{v}_{A,k},\ \vect{v}_{B,k}
+  \bigr\},
+  \label{eq:contact_record}
+\end{equation}
+\begin{itemize}
+  \item $\text{link}_A$, $\text{link}_B$ --- какие звенья SDF участвуют
+  (например \code{base\_link} и \code{ground\_plane});
+  \item $\vect{c}_k$ --- точка на поверхности в \textbf{мировой} системе;
+  \item $\vect{n}_k$ --- нормаль «от $A$ к $B$» (направление запрета проникновения);
+  \item $\delta_k$ --- глубина взаимного проникновения (EPA), м;
+  \item скорости в точке с учётом вращения звена:
+\end{itemize}
+\begin{equation}
+  \vect{v}_{A,k} = \vect{v}_{A,\mathrm{cm}}
+  + \vect{\omega}_A \times (\vect{c}_k - \vect{r}_{A,\mathrm{cm}}),
+  \label{eq:contact_velocity}
+\end{equation}
+аналогично для $B$. Относительная скорость:
+$\vect{v}_{\mathrm{rel},k} = \vect{v}_{B,k}-\vect{v}_{A,k}$.
+
+Нормальная и касательные компоненты:
+\begin{equation}
+  v_{n,k} = \vect{n}_k^\top \vect{v}_{\mathrm{rel},k},
+  \qquad
+  \vect{v}_{t,k} = \vect{v}_{\mathrm{rel},k} - v_{n,k}\,\vect{n}_k.
+  \label{eq:vn}
+\end{equation}
+
+\paragraph{Manifold (устойчивость).}
+Чтобы контакт не «прыгал» между треугольниками mesh, движки кэшируют
+\textbf{манифольд} --- набор $\mathcal{C}_k$, близкий к предыдущему шагу.
+Иначе при покое на mesh сила дрожит, хотя визуально дрон неподвижен.
+
+\subsection{Передача энергии при контакте}
+
+Контакт меняет не только силы, но и \textbf{энергию} системы.
+
+\paragraph{Работа контактной силы за шаг.}
+\begin{equation}
+  W_k^{\mathrm{contact}} \approx
+  \vect{F}_{\mathrm{contact},k} \cdot \Delta\vect{p}_k,
+  \qquad
+  \Delta\vect{p}_k \approx \vect{v}_{\mathrm{rel},k}\,\Delta t,
+  \label{eq:contact_work}
+\end{equation}
+где $\vect{F}_{\mathrm{contact},k}$ из \eqref{eq:contact_force}.
+При посадке нормальная составляющая делает отрицательную работу
+(тормозит падение), переводя кинетическую энергию в деформацию/импульс.
+
+\paragraph{Импульс и кинетическая энергия.}
+Импульс $\vect{J}_k = \vect{F}_{\mathrm{contact},k}\,\Delta t$
+изменяет скорости звеньев:
+\begin{equation}
+  \Delta \vect{v}_A = -\mat{M}_A^{-1}\,\vect{J}_k,\quad
+  \Delta \vect{v}_B = +\mat{M}_B^{-1}\,\vect{J}_k
+  \quad \text{(упрощённо, без вращения)}.
+\end{equation}
+Изменение кинетической энергии тела $A$:
+\begin{equation}
+  \Delta E_{k,A} =
+  \tfrac{1}{2} m_A \norm{\vect{v}_A+\Delta\vect{v}_A}^2
+  - \tfrac{1}{2} m_A \norm{\vect{v}_A}^2
+  \approx \vect{v}_A^\top (m_A \Delta\vect{v}_A).
+  \label{eq:delta_KE}
+\end{equation}
+В полной модели DART учитывается и вращательная часть через
+$\vect{J}_k$ и моменты от приложения силы в $\vect{c}_k$.
+
+\paragraph{Нормальный импульс и восстановление.}
+Скалярный нормальный импульс $\lambda_{n,k}$ из LCP задаёт скачок
+нормальной относительной скорости:
+\begin{equation}
+  v_{n,k}^{+} = v_{n,k}^{-} + \Delta v_{n,k},
+  \qquad
+  \Delta v_{n,k} \approx \frac{\lambda_{n,k}}{m_{\mathrm{eff},k}},
+  \label{eq:impulse_normal}
+\end{equation}
+$m_{\mathrm{eff},k}$ --- эффективная масса вдоль $\vect{n}_k$
+(из $\vect{J}_k^\top \mat{M}^{-1}\vect{J}_k$).
+Коэффициент реституции \eqref{eq:restitution} ограничивает
+\textbf{отскок}: часть энергии «теряется» ($e<1$), иначе дрон
+бесконечно подпрыгивал бы с пола.
+
+\paragraph{Трение и диссипация.}
+Касательный импульс $\vect{\lambda}_{t,k}$ гасит скольжение:
+\begin{equation}
+  E_{\mathrm{diss},k}^{\mathrm{fric}} \approx
+  -\vect{\lambda}_{t,k} \cdot \vect{v}_{t,k},
+  \label{eq:fric_diss}
+\end{equation}
+энергия уходит в тепло (модельно, не считается явно).
+
+\paragraph{Split impulse и «фантомная» энергия.}
+Коррекция \eqref{eq:split_impulse} сдвигает \textbf{положение},
+не добавляя скорости --- это численный приём против проникновения mesh
+в пол, а не физический пружинный удар.
+
+\paragraph{Сравнение с SITL.}
+В SITL-only $W_k^{\mathrm{contact}} = 0$: энергия меняется только
+от тяги, drag и гравитации \eqref{eq:sitl_v}; удара о пол в уравнениях нет.
+
+\subsection{Контактное ограничение (непроникновение)}
+
+Требование отсутствия проникновения на уровне скоростей:
+\begin{equation}
+  v_{n,k} + \dot{\delta}_k \geq 0
+  \quad\Leftrightarrow\quad
+  v_{n,k} \geq -\frac{\delta_k}{\Delta t}
+  \label{eq:nonpenetration}
+\end{equation}
+(в DART используется velocity-based формулировка с допуском Baumgarte).
+
+Импульс $\lambda_{n,k} \geq 0$ вдоль $\vect{n}_k$ удовлетворяет
+\textbf{дополнению}:
+\begin{equation}
+  \lambda_{n,k}\, v_{n,k} = 0.
+  \label{eq:complementarity}
+\end{equation}
+Либо контакт разрывается ($\lambda_{n,k}=0$), либо нормальная
+относительная скорость нулевая.
+
+\subsection{Трение Coulomb}
+
+В касательной плоскости с ортонормированным базисом
+$\{\vect{t}_{1,k}, \vect{t}_{2,k}\}$:
+\begin{equation}
+  \vect{\lambda}_{t,k} = \lambda_{t,1,k}\,\vect{t}_{1,k}
+  + \lambda_{t,2,k}\,\vect{t}_{2,k},
+  \qquad
+  \norm{\vect{\lambda}_{t,k}} \leq \mu\,\lambda_{n,k},
+  \label{eq:coulomb}
+\end{equation}
+где $\mu$ --- коэффициент трения из SDF (\code{surface/friction/ode/mu}).
+
+Касательные скорости:
+\begin{align}
+  v_{t,1,k} &= \vect{t}_{1,k}^\top(\vect{v}_{B,k}-\vect{v}_{A,k}), \\
+  v_{t,2,k} &= \vect{t}_{2,k}^\top(\vect{v}_{B,k}-\vect{v}_{A,k}).
+\end{align}
+
+\subsection{Матричная форма LCP (boxed)}
+
+Для всех контактов и суставных ограничений собирается система:
+\begin{equation}
+  \mat{A}\,\vect{\lambda} + \vect{b} = \vect{w},
+  \qquad
+  \vect{l} \leq \vect{\lambda} \leq \vect{u},
+  \qquad
+  \vect{\lambda} \circ \vect{w} = \vect{0},
+  \label{eq:lcp}
+\end{equation}
+где $\circ$ --- покомпонентное произведение (complementarity),
+$\vect{l},\vect{u}$ --- нижние/верхние границы (для трения --- зависят
+от $\lambda_n$ через \emph{findex}).
+
+Блок $\mat{A}$ строится из:
+\begin{equation}
+  A_{ij} = \vect{J}_i\,\mat{M}^{-1}\,\vect{J}_j^\top,
+  \qquad
+  b_i = -v_i^{\mathrm{constraint}} + b_i^{\mathrm{bias}},
+  \label{eq:lcp_A}
+\end{equation}
+где $\vect{J}_i$ --- строка якобиана $i$-го ограничения
+(нормаль или касательная).
+
+После решения:
+\begin{equation}
+  \Delta \vect{v} = \mat{M}^{-1}\,\vect{J}^\top\,\vect{\lambda},
+  \qquad
+  \vect{v}_{n+1} = \vect{v}_n + \Delta\vect{v},
+  \label{eq:impulse_apply}
+\end{equation}
+\begin{equation}
+  \vect{F}_{\mathrm{contact},k} \approx
+  \frac{\lambda_{n,k}\,\vect{n}_k
+  + \lambda_{t,1,k}\,\vect{t}_{1,k}
+  + \lambda_{t,2,k}\,\vect{t}_{2,k}}{\Delta t}.
+  \label{eq:contact_force}
+\end{equation}
+
+\subsection{Коэффициент восстановления (restitution)}
+
+Для упругого отскока вводится целевая нормальная скорость:
+\begin{equation}
+  v_{n,k}^{\mathrm{target}} = -e\, v_{n,k}^{-},
+  \label{eq:restitution}
+\end{equation}
+$e \in [0,1]$ из \code{surface/bounce/restitution\_coefficient},
+$v_{n,k}^{-}$ --- нормальная скорость до импульса.
+При $e=0$ --- неупругое касание (мягкая посадка).
+
+\subsection{Split impulse (коррекция позиции)}
+
+Чтобы убрать визуальное проникновение без «взрыва» энергии,
+DART/Gazebo применяют \textbf{split impulse}:
+\begin{equation}
+  \vect{p}_{n+1}^{\mathrm{corr}} =
+  \vect{p}_n - \beta\,\sum_k \delta_k\,\vect{n}_k,
+  \label{eq:split_impulse}
+\end{equation}
+где $\beta \in (0,1]$ --- коэффициент коррекции (ERP-подобный параметр).
+Скорости при этом корректируются отдельным LCP, что отличается от
+простого «подталкивания» тела вверх на $\delta$.
+
+\subsection{Параметры SDF для поверхности}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{SDF-тег} & \textbf{Влияние на модель} \\
+\hline
+\code{mu}, \code{mu2} & $\mu$ в \eqref{eq:coulomb} \\
+\code{slip1}, \code{slip2} & допуск проскальзывания \\
+\code{restitution\_coefficient} & $e$ в \eqref{eq:restitution} \\
+\code{kp}, \code{kd}, \code{min\_depth} & жёсткость контакта (ODE-совместимые) \\
+\code{max\_contacts} & макс.\ число точек на пару тел \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Ограничения суставов (дополнение к LCP)}
+
+Помимо контактов, DART добавляет в \eqref{eq:lcp} строки для:
+\begin{itemize}
+  \item \textbf{Joint limits:} $q_j \in [q_{j,\min}, q_{j,\max}]$;
+  \item \textbf{Joint motors/servo:} $\tau_j = k_p(q_j^{\mathrm{des}}-q_j) - k_d\dot{q}_j$;
+  \item \textbf{Weld/fixed:} полное запрещение относительного движения.
+\end{itemize}
+При нарушении лимита вводится одностороннее ограничение с импульсом,
+аналогичным \eqref{eq:complementarity}. Для \code{revolute} ротора
+$\theta_i \in [\theta_{\min}, \theta_{\max}]$ (часто без жёсткого лимита,
+только скорость через \code{JointVelocityCmd}).
+
+\subsection{Сложность при посадке дрона}
+
+Для квадрокоптера с mesh-коллизией рамы на плоскости $z=0$:
+\begin{itemize}
+  \item broadphase: $O(m\log m)$;
+  \item narrowphase: до $O(|\mathcal{P}_{\mathrm{cand}}| \cdot N_{\triangle})$
+  для mesh;
+  \item LCP: $O(c^3)$, $c$ --- число контактов + лимитов суставов
+  (типично $c \gg 4$ при mesh, против $c=0$ в SITL-only).
+\end{itemize}
+
+%====================================================================
+\section{ArduPilot SITL: математическая модель}
+\label{sec:sitl}
+%====================================================================
+
+В проекте \code{Drone\_Swarm\_Simulator\_v2} динамика задаётся классом
+\code{SITL::MultiCopter} (\code{SIM\_Multicopter.cpp}) и
+\code{Motor::calculate\_forces} (\code{SIM\_Motor.cpp}).
+
+\subsection{Состояние и интегратор}
+
+Вектор состояния (12-мерный):
+\[
+  \vect{x} = (\vect{p}^\top,\ \vect{\eta}^\top,\ \vect{v}^\top,\ \vect{\omega}^\top)^\top,
+\]
+NED: $z$ вниз, $g=(0,0,G)^\top$, $G \approx 9.80665$ м/с$^2$.
+
+Уравнения (непрерывный аналог \code{Aircraft::update\_dynamics}):
+\begin{align}
+  \dot{\vect{p}} &= \vect{v},
+  \label{eq:sitl_p}\\
+  m\dot{\vect{v}} &= \mat{R}\,\vect{f}_b + m\vect{g},
+  \label{eq:sitl_v}\\
+  \mat{J}\dot{\vect{\omega}} &= \vect{M}_b - \vect{\omega}\times(\mat{J}\vect{\omega}),
+  \label{eq:sitl_omega}\\
+  \dot{\mat{R}} &= \mat{R}\,\mat{S}(\vect{\omega}).
+  \label{eq:sitl_R}
+\end{align}
+
+\textbf{Явное} дискретное обновление (шаг $\Delta t$ из \code{frame\_time\_us}):
+\begin{align}
+  \vect{\omega} &\leftarrow \vect{\omega} + \dot{\vect{\omega}}\,\Delta t,
+  \label{eq:sitl_disc_gyro}\\
+  \mat{R} &\leftarrow \mat{R}\,\Delta\mat{R}(\vect{\omega}\Delta t),
+  \label{eq:sitl_disc_R}\\
+  \vect{v} &\leftarrow \vect{v} + \vect{a}_e\,\Delta t,
+  \quad \vect{a}_e = \mat{R}\vect{a}_b + \vect{g},
+  \label{eq:sitl_disc_v}\\
+  \vect{p} &\leftarrow \vect{p} + \vect{v}\,\Delta t.
+  \label{eq:sitl_disc_p}
+\end{align}
+
+\subsection{Тяга ротора в SITL (модель импульсного диска)}
+
+Команда из PWM:
+\begin{equation}
+  u = \mathrm{clip}\Bigl(
+  \frac{\mathrm{pwm} - \mathrm{pwm}_{\min}}{\mathrm{pwm}_{\max}-\mathrm{pwm}_{\min}},
+  0, 1 \Bigr).
+  \label{eq:sitl_pwm}
+\end{equation}
+
+Скорость набегания потока на винт (body frame):
+\begin{align}
+  \vect{v}_{\mathrm{motor}} &= \vect{v}_{\mathrm{air},b}
+  - (\vect{r}_{\mathrm{motor}} \times \vect{\omega}),
+  \label{eq:sitl_vmotor}\\
+  v_{\mathrm{in}} &= \max\bigl(0,\,-\vect{v}_{\mathrm{motor}}\cdot\vect{e}_T\bigr),
+  \label{eq:sitl_vin}
+\end{align}
+где $\vect{e}_T$ --- ось тяги, $\vect{r}_{\mathrm{motor}}$ --- плечо мотора.
+
+Выходная скорость струи и тяга:
+\begin{align}
+  v_{\mathrm{out}} &= \eta_{\mathrm{volt}}\, v_{\max}\,
+  \sqrt{(1-\varepsilon)\,u + \varepsilon\, u^2},
+  \label{eq:sitl_vout}\\
+  T &= \tfrac{1}{2}\,\rho\, A_{\mathrm{eff}}\,
+  \bigl(v_{\mathrm{out}}^2 - v_{\mathrm{in}}^2\bigr),
+  \label{eq:sitl_thrust}
+\end{align}
+где $\rho$ --- плотность воздуха, $A_{\mathrm{eff}}$ --- эффективная площадь
+диска, $\varepsilon$ --- \code{mot\_expo}, $\eta_{\mathrm{volt}}$ --- масштаб
+от напряжения батареи.
+
+\paragraph{Сравнение с Gazebo.}
+В Gazebo \eqref{eq:thrust}: $T \propto \omega^2$ без явного $v_{\mathrm{in}}$.
+В SITL \eqref{eq:sitl_thrust} учитывает \textbf{осевой встречный поток}
+(inflow), что физичнее для набора высоты, но всё ещё без blade-element theory.
+
+\subsection{Моменты в SITL}
+
+Тяга в body frame: $\vect{F}_T = \vect{e}_T\, T$.
+Реактивный момент (yaw), ось вдоль $\vect{e}_T$:
+\begin{equation}
+  \vect{\tau}_{\mathrm{yaw}} =
+  -\zeta_{\mathrm{yaw}}\, u\, T\,\vect{e}_T,
+  \label{eq:sitl_yaw}
+\end{equation}
+$\zeta_{\mathrm{yaw}} = 0.05 \cdot d_{\mathrm{diag}} \cdot \code{yaw\_factor}$
+(из \code{SIM\_Motor.cpp}, $d_{\mathrm{diag}}$ --- размер рамы).
+
+Полный момент:
+\begin{equation}
+  \vect{M}_b = \vect{r}_{\mathrm{motor}} \times \vect{F}_T
+  + \vect{\tau}_{\mathrm{yaw}} + \cdots
+  \label{eq:sitl_moment}
+\end{equation}
+
+\subsection{Momentum drag (опционально)}
+
+При \code{use\_drag=true}:
+\begin{equation}
+  \vect{F}_{\mathrm{md}} =
+  -c_{\mathrm{md}}\sqrt{\rho}\,
+  \begin{pmatrix}
+    v_x (\sqrt{|F_{T,y}|}+\sqrt{|F_{T,z}|}) \\
+    v_y (\sqrt{|F_{T,x}|}+\sqrt{|F_{T,z}|}) \\
+    v_z (\sqrt{|F_{T,x}|}+\sqrt{|F_{T,y}|}+\sqrt{|F_{T,z}|})
+  \end{pmatrix},
+  \label{eq:sitl_momentum_drag}
+\end{equation}
+$c_{\mathrm{md}} = \code{momentum\_drag\_coefficient}$.
+В Gazebo аналог --- \eqref{eq:blade_drag}, но с другой структурой.
+
+\subsection{Что SITL \emph{не} считает}
+
+\begin{itemize}
+  \item контакты с землёй, стенами, другими дронами;
+  \item отдельные вращающиеся звенья роторов в дереве кинематики;
+  \item LCP и $\mat{M}(\vect{q})$ полной системы;
+  \item mesh-коллизии и множественные точки контакта;
+  \item joint limits, friction в осях (кроме параметров рамы).
+\end{itemize}
+Высота в SITL-only ограничена только управлением автопилота, не физикой среды.
+
+%====================================================================
+\section{Сравнение SITL и Gazebo: сложность модели}
+\label{sec:compare}
+%====================================================================
+
+\subsection{Сводная таблица}
+
+\begin{center}
+\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{|p{3.8cm}|p{5.2cm}|p{5.5cm}|}
+\hline
+\textbf{Аспект} & \textbf{ArduPilot SITL-only} & \textbf{Gazebo Sim + DART} \\
+\hline
+Число тел & 1 жёсткое тело (рамка) & Дерево: корпус + 4 ротора + среда \\
+\hline
+Степени свободы & 6 (фикс.\ тело) & $6 + n_{\mathrm{joint}}$ (тип.\ $6+4$) \\
+\hline
+Уравнения & \eqref{eq:sitl_p}--\eqref{eq:sitl_R} & \eqref{eq:dart_eom} + \eqref{eq:lcp} \\
+\hline
+Матрица масс & постоянная $\mat{J}$, $m$ & $\mat{M}(\vect{q})$ полная \\
+\hline
+Интегратор & явный Эйлер \eqref{eq:sitl_disc_v} & semi-implicit + LCP \\
+\hline
+Тяга & \eqref{eq:sitl_thrust} (inflow) & \eqref{eq:thrust} ($\omega^2$) \\
+\hline
+Контакты & \textbf{нет} & \eqref{eq:contact_force}, \eqref{eq:coulomb} \\
+\hline
+Mesh / сетка & не используется & GJK/EPA, convex decomp. \\
+\hline
+Параметры среды & $\rho$, $g$, батарея & $\rho$, $g$, $\mu$, $e$, mesh, wind \\
+\hline
+Стоимость шага & $O(1)$ по телам & $O(n) + O(c^3)$ контакты \\
+\hline
+\end{tabular}
+\end{center}
+
+Ниже --- разбор \textbf{каждой строки} с явными формулами.
+
+%--------------------------------------------------------------------
+\subsection{Число тел}
+%--------------------------------------------------------------------
+
+\textbf{SITL:} одно агрегированное тело с массой $m$ и инерцией $\mat{J}$.
+Все четыре мотора --- точки приложения сил:
+\begin{equation}
+  \vect{F}_b = \sum_{i=1}^{4} \vect{F}_{T,i}, \qquad
+  \vect{M}_b = \sum_{i=1}^{4}
+  \bigl(\vect{r}_i \times \vect{F}_{T,i} + \vect{\tau}_{Q,i}\bigr).
+  \label{eq:sitl_aggregate}
+\end{equation}
+Геометрических «тел» для контакта нет.
+
+\textbf{Gazebo:} минимум $n_{\mathrm{body}} = 5$ звеньев на дрон
+(1 корпус + 4 ротора) плюс $n_{\mathrm{env}}$ тел среды (пол, препятствия):
+\begin{equation}
+  n_{\mathrm{total}} = n_{\mathrm{body}} + n_{\mathrm{env}},
+  \qquad
+  n_{\mathrm{coll}} \geq n_{\mathrm{total}}
+  \quad \text{(если у link несколько \code{collision})}.
+  \label{eq:nbodies}
+\end{equation}
+Каждое звено --- отдельный \code{BodyNode} в \eqref{eq:dart_eom};
+контакт «корпус--пол» и «луч--стена» --- разные пары в
+\eqref{eq:broadphase}.
+
+%--------------------------------------------------------------------
+\subsection{Степени свободы}
+%--------------------------------------------------------------------
+
+\textbf{SITL:} вектор состояния размерности 12:
+\begin{equation}
+  \dim \vect{x}_{\mathrm{SITL}} = 12,
+  \quad
+  \vect{x} = (p_x,p_y,p_z,\eta_x,\eta_y,\eta_z,
+  v_x,v_y,v_z,\omega_x,\omega_y,\omega_z)^\top.
+  \label{eq:sitl_state_dim}
+\end{equation}
+Три поступательных + три вращательных DOF \emph{всего аппарата};
+скорости роторов не входят в $\vect{x}$.
+
+\textbf{Gazebo:} при \code{free} + 4$\times$\code{revolute}:
+\begin{equation}
+  \dim \vect{q} = 6 + 4 = 10,
+  \qquad
+  \dim \dot{\vect{q}} = 10,
+  \label{eq:gazebo_dof}
+\end{equation}
+плюс скрытые ограничения контактов (не координаты, а $\vect{\lambda}$
+в \eqref{eq:lcp}). При фиксированном корпусе и \code{revolute} только
+на моторах: $\dim\vect{q} = 4$, но положение корпуса всё равно 6 DOF
+в мире через \code{free joint}.
+
+%--------------------------------------------------------------------
+\subsection{Уравнения движения}
+%--------------------------------------------------------------------
+
+\textbf{SITL} (замкнутая система без контактов):
+\begin{equation}
+  \dot{\vect{x}} =
+  f_{\mathrm{SITL}}(\vect{x}, \vect{u}_{\mathrm{PWM}}, \rho, V_{\mathrm{bat}}),
+  \label{eq:sitl_ode}
+\end{equation}
+где $f_{\mathrm{SITL}}$ реализует \eqref{eq:sitl_p}--\eqref{eq:sitl_R}
+с силами \eqref{eq:sitl_thrust}--\eqref{eq:sitl_moment}.
+
+\textbf{Gazebo:}
+\begin{equation}
+  \underbrace{\mat{M}(\vect{q})\ddot{\vect{q}}
+  + \vect{C} + \vect{G}}_{\text{динамика скелета}}
+  =
+  \underbrace{\vect{\tau}_{\mathrm{motor}}}_{\text{плагины}}
+  +
+  \underbrace{\vect{J}_c^\top \vect{\lambda}}_{\text{контакты}},
+  \label{eq:gazebo_full}
+\end{equation}
+плюс алгебраические ограничения \eqref{eq:lcp}.
+Размерность \eqref{eq:gazebo_full}: $n_q$ уравнений + $c$ неравенств LCP.
+
+%--------------------------------------------------------------------
+\subsection{Матрица масс}
+%--------------------------------------------------------------------
+
+\textbf{SITL:} постоянные скаляр $m$ и тензор $\mat{J}$ (из параметров рамы):
+\begin{equation}
+  m\dot{\vect{v}} = \mat{R}\vect{f}_b + m\vect{g},
+  \qquad
+  \mat{J}\dot{\vect{\omega}} = \vect{M}_b - \vect{\omega}\times\mat{J}\vect{\omega}.
+  \label{eq:sitl_mass_const}
+\end{equation}
+$\mat{M}_{\mathrm{SITL}} = \mathrm{diag}(m\mat{E}_3, \mat{J})$ в 6D-пространстве
+(в связанных осях для вращения).
+
+\textbf{Gazebo:} полная $\mat{M}(\vect{q}) \in \R^{n_q \times n_q}$:
+\begin{equation}
+  M_{ij}(\vect{q}) =
+  \frac{\partial}{\partial \ddot{q}_j}
+  \Bigl[\tau_i^{\mathrm{ID}}(\vect{q},\dot{\vect{q}},\ddot{\vect{q}})\Bigr],
+  \label{eq:mass_matrix_def}
+\end{equation}
+учитывает:
+\begin{itemize}
+  \item массу корпуса и каждого ротора;
+  \item положение $\theta_i$ (меняется $\mat{M}$ при повороте лучей);
+  \item связи суставов (недиагональные $M_{ij}$).
+\end{itemize}
+Пример: при разгоне $\dot{\theta}_i$ ротор тянет корпус --- в SITL это
+только через $\vect{F}_b$; в DART ещё через $M_{ij}$ между $\ddot{\theta}_i$
+и $\ddot{p}$.
+
+%--------------------------------------------------------------------
+\subsection{Интегратор}
+%--------------------------------------------------------------------
+
+\textbf{SITL --- явный (forward) Euler.}
+Из \eqref{eq:sitl_disc_gyro}--\eqref{eq:sitl_disc_p}:
+\begin{align}
+  \vect{\omega}_{n+1} &= \vect{\omega}_n + \ddot{\vect{\omega}}_n\,\Delta t,
+  \\
+  \mat{R}_{n+1} &= \mat{R}_n\,\Delta\mat{R}(\vect{\omega}_n\Delta t),
+  \\
+  \vect{v}_{n+1} &= \vect{v}_n + (\mat{R}_n\vect{a}_{b,n} + \vect{g})\,\Delta t,
+  \\
+  \vect{p}_{n+1} &= \vect{p}_n + \vect{v}_n\,\Delta t.
+  \label{eq:sitl_euler_explicit}
+\end{align}
+Замечание: скорость в \eqref{eq:sitl_disc_p} берётся \textbf{старой}
+$\vect{v}_n$ (не $\vect{v}_{n+1}$) --- это чистый явный Эйлер;
+при больших $\Delta t$ возможна нестабильность (в SITL $\Delta t$ малый,
+$\sim 1/300$ с).
+
+\textbf{Gazebo --- semi-implicit Euler + LCP.}
+Сначала решают импульсы при \emph{текущих} скоростях, затем:
+\begin{align}
+  \dot{\vect{q}}_{n+1} &= \dot{\vect{q}}_n + \ddot{\vect{q}}_n\,\Delta t,
+  \label{eq:gazebo_vel_int}\\
+  \vect{q}_{n+1} &= \vect{q}_n + \dot{\vect{q}}_{n+1}\,\Delta t,
+  \label{eq:gazebo_pos_int}
+\end{align}
+где $\ddot{\vect{q}}_n$ уже включает $\vect{J}_c^\top\vect{\lambda}$ из
+\eqref{eq:impulse_apply}. Это \textbf{симплектическая} схема для
+свободного движения; контакт добавляет диссипацию \eqref{eq:fric_diss}.
+
+\paragraph{Сравнение устойчивости.}
+При контакте явный SITL без пола не решает LCP; Gazebo на каждом шаге
+при $\delta_k > 0$ решает \eqref{eq:lcp} --- иначе тело провалится сквозь
+\code{plane}.
+
+%--------------------------------------------------------------------
+\subsection{Тяга}
+%--------------------------------------------------------------------
+
+\textbf{SITL:} \eqref{eq:sitl_thrust} с inflow \eqref{eq:sitl_vin}.
+
+\textbf{Gazebo:} \eqref{eq:thrust}--\eqref{eq:blade_drag} с фильтром
+\eqref{eq:motor_filter}. Эквивалентность при $v_{\mathrm{in}} \approx 0$,
+$\rho=\mathrm{const}$: $T \approx k_f \omega^2$ с подбором $k_f$.
+
+%--------------------------------------------------------------------
+\subsection{Контакты}
+%--------------------------------------------------------------------
+
+\textbf{SITL:}
+\begin{equation}
+  \vect{F}_{\mathrm{contact}}^{\mathrm{SITL}} \equiv \vect{0},
+  \qquad
+  \vect{\lambda} \equiv \vect{0}.
+  \label{eq:sitl_no_contact}
+\end{equation}
+
+\textbf{Gazebo:} при $c$ контактах полная система \eqref{eq:lcp}--\eqref{eq:contact_force};
+энергия \eqref{eq:delta_KE}--\eqref{eq:fric_diss}.
+
+%--------------------------------------------------------------------
+\subsection{Mesh и детектор}
+%--------------------------------------------------------------------
+
+\textbf{SITL:} нет \eqref{eq:broadphase}--\eqref{eq:penetration}.
+
+\textbf{Gazebo:} для каждой пары из $\mathcal{P}_{\mathrm{cand}}$
+GJK $\Rightarrow$ при пересечении EPA $\Rightarrow$ $\delta_k$, $\vect{n}_k$
+$\Rightarrow$ $\mathcal{C}_k$ \eqref{eq:contact_record}.
+
+%--------------------------------------------------------------------
+\subsection{Параметры среды}
+%--------------------------------------------------------------------
+
+\textbf{SITL:} $\rho$ в \eqref{eq:sitl_thrust}, $\vect{g}$ в \eqref{eq:sitl_v},
+$V_{\mathrm{bat}}$ в \eqref{eq:sitl_vout}; $\mu$, $e$, mesh --- не определены.
+
+\textbf{Gazebo:} дополнительно $\mu$ \eqref{eq:coulomb}, $e$ \eqref{eq:restitution},
+геометрия пола, \code{Wind} в \eqref{eq:vrel}.
+
+%--------------------------------------------------------------------
+\subsection{Стоимость шага}
+%--------------------------------------------------------------------
+
+\textbf{SITL:}
+\begin{equation}
+  T_{\mathrm{step}}^{\mathrm{SITL}} =
+  O(1)\ \text{(4 мотора)} + O(1)\ \text{(интеграция 12 состояний)}.
+  \label{eq:cost_sitl}
+\end{equation}
+
+\textbf{Gazebo:}
+\begin{equation}
+  T_{\mathrm{step}}^{\mathrm{GZ}} =
+  O(n)\ \text{(ABA)} +
+  O(m \log m)\ \text{(broadphase)} +
+  |\mathcal{P}_{\mathrm{cand}}|\,T_{\mathrm{GJK/EPA}} +
+  O(c^3)\ \text{(LCP)}.
+  \label{eq:cost_gazebo}
+\end{equation}
+При посадке mesh-рамы $c$ может быть 10--100+, доминирует LCP.
+
+\subsection{Почему Gazebo «сложнее» при тех же выходных величинах}
+
+С точки зрения пользователя автопилота важны
+$\vect{p}, \mat{R}, \vect{v}, \vect{\omega}$.
+И SITL, и Gazebo их выдают, но:
+
+\begin{enumerate}
+  \item \textbf{Размерность задачи.}
+  SITL: 12 ОДУ + алгебра тяг. Gazebo: столько же \emph{плюс}
+  обобщённые координаты суставов, $\mat{M}(\vect{q})$, $\vect{C}$, $\vect{G}$,
+  и при посадке --- сотни неравенств \eqref{eq:lcp}.
+
+  \item \textbf{Столкновения.}
+  В Gazebo посадка --- решение контактной задачи с трением
+  \eqref{eq:coulomb}--\eqref{eq:impulse_apply}.
+  В SITL-only дрон может «провалиться» сквозь пол: физического пола нет.
+
+  \item \textbf{Геометрия.}
+  Gazebo: mesh $\Rightarrow$ треугольники $\Rightarrow$ множество
+  $\vect{c}_k, \delta_k$ в \eqref{eq:contact_record}.
+  SITL: геометрический объём аппарата не участвует в динамике.
+
+  \item \textbf{Связность.}
+  DART учитывает вращение пропеллеров как DOF суставов
+  (\eqref{eq:joint_vel}); SITL --- кинематически не моделирует отдельные
+  лопасти, только агрегированную тягу.
+
+  \item \textbf{Численная устойчивость.}
+  Gazebo вынужден решать LCP каждый шаг при контакте;
+  SITL --- простое суммирование сил без complementarity.
+\end{enumerate}
+
+\subsection{Схема потоков данных}
+
+\begin{center}
+\begin{tabular}{|c|c|}
+\hline
+\textbf{SITL-only (Kursov3)} & \textbf{Gazebo Sim} \\
+\hline
+PWM $\to$ \eqref{eq:sitl_pwm} $\to$ \eqref{eq:sitl_thrust}
+& Actuators $\to$ \eqref{eq:motor_filter} $\to$ \eqref{eq:thrust} \\
+$\to$ \eqref{eq:sitl_moment} $\to$ \eqref{eq:sitl_v}--\eqref{eq:sitl_omega}
+& $\to$ \eqref{eq:newton}, \eqref{eq:euler} $\to$ \eqref{eq:dart_eom} \\
+$\to$ \eqref{eq:sitl_disc_p}
+& $\to$ collision $\to$ \eqref{eq:lcp} $\to$ \eqref{eq:dart_pos} \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Режим Webots в проекте}
+
+При \code{SIM\_Webots\_Python} интегрирование выполняет \textbf{Webots}
+(свой физический движок и контакты); SITL только принимает
+\code{fdm\_packet}. Это третий вариант: ближе к Gazebo по наличию среды,
+но формулы зависят от движка Webots, а не DART.
+
+%====================================================================
+\section{Численный цикл одного шага симуляции}
+%====================================================================
+
+Упрощённая последовательность (\code{Physics::Update} + systems
+\code{PreUpdate}):
+
+\begin{enumerate}
+  \item Системы \code{PreUpdate} (в т.\,ч.\ \code{MulticopterMotorModel}):
+  читают команды, выставляют \code{JointVelocityCmd}, добавляют
+  \code{ExternalWorldWrenchCmd} (силы/моменты).
+  \item \code{Physics}: DART \code{World::step()}:
+  \begin{enumerate}
+    \item detect collisions;
+    \item собрать joint + contact constraints;
+    \item решить LCP $\Rightarrow$ импульсы;
+    \item интегрировать $\vect{q}, \vect{v}, \vect{\omega}$ за $\Delta t$.
+  \end{enumerate}
+  \item Системы \code{PostUpdate}: публикация одometry, sensors.
+\end{enumerate}
+
+Параметры мира из \code{quadcopter.sdf}:
+\code{max\_step\_size} = 0.001 с, \code{real\_time\_factor} = 1.
+
+%====================================================================
+\section{Пример численных параметров (модель X3)}
+%====================================================================
+
+Из \code{examples/worlds/quadcopter.sdf} для каждого ротора:
+\begin{align*}
+  k_f &= 8.54858\times 10^{-6}\ \text{Н/(рад/с)}^2, &
+  k_m &= 0.016\ \text{м}, \\
+  \Omega_{\max} &= 800\ \text{рад/с}, &
+  n_s &= 10, \\
+  \tau_\uparrow &= 0.0125\ \text{с}, &
+  \tau_\downarrow &= 0.025\ \text{с}, \\
+  b_f &= 8.06428\times 10^{-5}, &
+  \mu_1 &= 10^{-6}.
+\end{align*}
+Максимальная тяга одного ротора (из \eqref{eq:thrust}):
+\[
+  T_{\max} \approx k_f\,\Omega_{\max}^2
+  \approx 8.55\times 10^{-6} \times 800^2 \approx 5.47\ \text{Н}.
+\]
+Для 4 роторов $T_{\Sigma,\max} \approx 21.9$ Н --- порядок массы X3
+($m \approx 1.5$--2 кг) при $g \approx 9.81$ м/с$^2$.
+
+%====================================================================
+\section{Ссылки на исходный код}
+%====================================================================
+
+\begin{itemize}
+  \item Gazebo Sim: \url{https://github.com/gazebosim/gz-sim}
+  \item DART: \url{https://github.com/dartsim/dart},
+  \code{docs/onboarding/architecture.md}
+  \item FCL (GJK/EPA): \url{https://github.com/flexible-collision-library/fcl}
+  \item ArduPilot SITL: \code{libraries/SITL/SIM\_Motor.cpp},
+  \code{SIM\_Aircraft.cpp}, \code{SIM\_Multicopter.cpp}
+  \item Gazebo: \code{MulticopterMotorModel.cc}, \code{LiftDrag.cc},
+  \code{Physics.cc}, \code{examples/worlds/quadcopter.sdf}
+\end{itemize}
+
+%====================================================================
+\section*{Заключение}
+%====================================================================
+
+\textbf{ArduPilot SITL} в режиме проекта Kursov3 решает компактную задачу:
+12 уравнений \eqref{eq:sitl_p}--\eqref{eq:sitl_R} с тягой
+\eqref{eq:sitl_thrust} и без контактов.
+\textbf{Gazebo Sim + DART} добавляет:
+\begin{enumerate}
+  \item полную динамику связной системы \eqref{eq:dart_eom};
+  \item неявную интеграцию с LCP \eqref{eq:lcp}--\eqref{eq:impulse_apply};
+  \item обнаружение столкновений \eqref{eq:broadphase}--\eqref{eq:penetration}
+  для примитивов и mesh-сеток;
+  \item контактные силы, трение \eqref{eq:coulomb} и восстановление
+  \eqref{eq:restitution}.
+\end{enumerate}
+
+Для дипломного сравнения: при одинаковых командах моторов
+\textit{кинематика в воздухе} может быть близкой (обе модели --- 6-DOF +
+квадратичная/импульсная тяга), но \textit{взаимодействие со средой}
+(посадка, удар, трение, несколько дронов) в Gazebo описывается
+существенно более богатой математикой раздела~\ref{sec:collision}
+и~\ref{sec:compare}, тогда как SITL-only эти эффекты не моделирует.
+
+\end{document}

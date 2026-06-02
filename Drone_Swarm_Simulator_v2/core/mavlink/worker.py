@@ -29,6 +29,9 @@ _SIM_STATE_MSG_ID: int = int(
 _HOME_POSITION_MSG_ID: int = int(
     getattr(mavutil.mavlink, "MAVLINK_MSG_ID_HOME_POSITION", 242)
 )
+_LOCAL_POSITION_NED_MSG_ID: int = int(
+    getattr(mavutil.mavlink, "MAVLINK_MSG_ID_LOCAL_POSITION_NED", 32)
+)
 
 # Main thread must not call recv / send on mavutil after the worker thread starts.
 _MAX_RECV_DRAIN_PER_ITER = 512
@@ -59,8 +62,10 @@ class MAVLinkWorker:
         # Condition waits for new position samples (SIM_STATE-derived NED).
         self._pos_cond = threading.Condition(self._state_lock)
         self._last_position: Optional[Dict[str, float]] = None
+        self._last_estimated_position: Optional[Dict[str, float]] = None
         self._last_attitude: Optional[Dict[str, float]] = None
         self._pos_seq: int = 0
+        self._est_pos_seq: int = 0
         self._att_seq: int = 0
         self._home_lat_deg: float = 0.0
         self._home_lon_deg: float = 0.0
@@ -69,6 +74,7 @@ class MAVLinkWorker:
         # time_boot from SIM_STATE pose (s); HEARTBEAT refills when SIM_STATE omits time_boot_ms.
         self._last_vehicle_sitl_time_boot_sec: Optional[float] = None
         self._last_position_sitl_time_boot_sec: Optional[float] = None
+        self._last_estimated_position_time_boot_sec: Optional[float] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._master: Any = None
@@ -114,7 +120,7 @@ class MAVLinkWorker:
         self.start()
 
     def _prime_telemetry_streams(self, hz: int = _DEFAULT_TELEMETRY_HZ) -> None:
-        """Request HOME_POSITION + SIM_STATE intervals (SITL truth pose)."""
+        """Request HOME_POSITION, SIM_STATE truth pose, and EKF local position."""
         if self._master is None:
             return
         m = self._master
@@ -129,6 +135,19 @@ class MAVLinkWorker:
             0,
             _HOME_POSITION_MSG_ID,
             home_interval_us,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        m.mav.command_long_send(
+            ts,
+            tc,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            _LOCAL_POSITION_NED_MSG_ID,
+            interval_us,
             0,
             0,
             0,
@@ -238,6 +257,26 @@ class MAVLinkWorker:
                         self._pos_seq += 1
                         self._att_seq += 1
                         self._pos_cond.notify_all()
+                elif mt == "LOCAL_POSITION_NED":
+                    with self._state_lock:
+                        self._last_estimated_position = {
+                            "x": float(getattr(msg, "x", 0.0)),
+                            "y": float(getattr(msg, "y", 0.0)),
+                            "z": float(getattr(msg, "z", 0.0)),
+                            "vx": float(getattr(msg, "vx", 0.0)),
+                            "vy": float(getattr(msg, "vy", 0.0)),
+                            "vz": float(getattr(msg, "vz", 0.0)),
+                        }
+                        if msg_time_boot_ms is not None:
+                            self._last_estimated_position_time_boot_sec = (
+                                float(msg_time_boot_ms) / 1000.0
+                            )
+                        else:
+                            self._last_estimated_position_time_boot_sec = (
+                                self._last_vehicle_sitl_time_boot_sec
+                            )
+                        self._est_pos_seq += 1
+                        self._pos_cond.notify_all()
 
             time.sleep(0.01)
 
@@ -300,6 +339,21 @@ class MAVLinkWorker:
                 mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                 0,
                 _SIM_STATE_MSG_ID,
+                interval_us,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+        elif cmd_type == "request_estimated_position_stream":
+            interval_us = int(1e6 / max(1, int(cmd.get("hz", 20))))
+            self._master.mav.command_long_send(
+                self._master.target_system,
+                self._master.target_component,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                _LOCAL_POSITION_NED_MSG_ID,
                 interval_us,
                 0,
                 0,
@@ -389,6 +443,11 @@ class MAVLinkWorker:
         with self._state_lock:
             return int(self._pos_seq)
 
+    def get_estimated_position_seq(self) -> int:
+        """Return current EKF local-position sequence number."""
+        with self._state_lock:
+            return int(self._est_pos_seq)
+
     def wait_for_new_position(
         self, last_seq: int, timeout_s: float = 0.25
     ) -> Optional[Tuple[int, Dict[str, float], Optional[float]]]:
@@ -414,6 +473,27 @@ class MAVLinkWorker:
                 return None
             sitl_s = self._last_position_sitl_time_boot_sec
             return (int(self._pos_seq), dict(self._last_position), sitl_s)
+
+    def wait_for_new_estimated_position(
+        self, last_seq: int, timeout_s: float = 0.25
+    ) -> Optional[Tuple[int, Dict[str, float], Optional[float]]]:
+        """
+        Block until a fresh LOCAL_POSITION_NED sample arrives.
+
+        Unlike SIM_STATE, LOCAL_POSITION_NED is emitted from the autopilot's
+        estimator path, so it is a better readiness gate before arm/takeoff.
+        """
+        deadline = time.time() + float(timeout_s)
+        with self._pos_cond:
+            while self._est_pos_seq <= int(last_seq) and self._running:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._pos_cond.wait(timeout=remaining)
+            if self._est_pos_seq <= int(last_seq) or self._last_estimated_position is None:
+                return None
+            sitl_s = self._last_estimated_position_time_boot_sec
+            return (int(self._est_pos_seq), dict(self._last_estimated_position), sitl_s)
 
     def get_attitude_seq(self) -> int:
         """Return current attitude sequence number (one increment per SIM_STATE)."""

@@ -225,5 +225,41 @@ python3 scripts/graphics.py \
 source ../drone_env/bin/activate
 
 python3 scripts/graphics.py \
-  --experiment /home/user/Kursov3/test_logov/fntena_logic_copy2_run \
+  --experiment /home/user/Kursov3/test_logov/antena_shum_run \
   --focus-drone 2
+
+
+
+
+  cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+source ../drone_env/bin/activate
+
+OUTDIR=/home/user/Kursov3/test_logov/fntena_logic_copy2_shum3_run
+mkdir -p "$OUTDIR"
+
+python launch_simulation.py -s -c fntena_logic_copy2_shum -n 4 \
+  --no-sitl-console --no-2d-visualizer \
+  --duration 60 \
+  --experiment-dir "$OUTDIR" \
+  --log-mode mavlink
+
+
+
+  cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+source ../drone_env/bin/activate
+
+OUTDIR=/home/user/Kursov3/test_logov/antena_NOshum_run
+mkdir -p "$OUTDIR"
+
+  python launch_simulation.py -s -c fntena_logic_copy2_shum -n 4 \
+  --no-sitl-console --no-2d-visualizer \
+  --duration 60 \
+  --experiment-dir "$OUTDIR" \
+  --log-mode mavlink \
+  --decision-position-source local
+
+
+
+  source /opt/ros/jazzy/setup.bash
+cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+python3 replay/replay_rviz2.py --experiment /home/user/Kursov3/test_logov/antena_shum_run --rviz

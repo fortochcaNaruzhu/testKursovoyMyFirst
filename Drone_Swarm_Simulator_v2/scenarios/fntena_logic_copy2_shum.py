@@ -35,6 +35,8 @@ from core.logging.csv_logger import (
     write_metadata,
     write_row_antena_telemetry,
 )
+from core.logging.mavlink_compare_logger import PassiveMAVLinkCompareLogger
+from core.mavlink.estimated_position_reader import PassiveEstimatedPositionReader
 from core.mavlink.utils import RC_NEUTRAL
 
 try:
@@ -94,10 +96,11 @@ BOOTSTRAP_STEP_PWM = 35
 
 # Allow baro/EKF to settle after MAVLink connect before ARM.
 POST_CONNECT_SETTLE_SEC = 7.0
+PRE_ARM_ESTIMATE_TIMEOUT_SEC = 35.0
 
 INIT_STEPS = [
     {"type": "set_mode", "mode_id": 4},  # GUIDED
-    {"type": "sleep", "sec": 1.0},
+    {"type": "sleep", "sec": 2.0},
     {"type": "arm"},
     {"type": "sleep", "sec": 4.0},
     {"type": "takeoff", "alt_m": 5.0},
@@ -187,6 +190,16 @@ def _ned_velocity(controller: DroneController) -> Tuple[float, float, float]:
         )
     except Exception:
         return (0.0, 0.0, 0.0)
+
+
+def _estimated_velocity(pos: Optional[Dict[str, float]]) -> Tuple[float, float, float]:
+    if pos is None:
+        return (0.0, 0.0, 0.0)
+    return (
+        float(pos.get("vx", 0.0)),
+        float(pos.get("vy", 0.0)),
+        float(pos.get("vz", 0.0)),
+    )
 
 
 def _visible_peers_vectors(
@@ -331,6 +344,7 @@ def initialize_drone_parallel(
     controller: DroneController,
     init_barrier: threading.Barrier,
     *,
+    decision_reader: PassiveEstimatedPositionReader,
     heartbeat_timeout_s: Optional[float],
     position_timeout_s: float = 10.0,
     barrier_timeout_sec: float = 60.0,
@@ -345,6 +359,16 @@ def initialize_drone_parallel(
         else:
             controller.connect()
         time.sleep(float(POST_CONNECT_SETTLE_SEC))
+        estimate_deadline = time.time() + float(PRE_ARM_ESTIMATE_TIMEOUT_SEC)
+        while time.time() < estimate_deadline:
+            if decision_reader.get_position(int(did)) is not None:
+                break
+            time.sleep(0.2)
+        else:
+            raise TimeoutError(
+                f"Drone {did}: no estimated position before ARM "
+                f"within {PRE_ARM_ESTIMATE_TIMEOUT_SEC:.1f}s"
+            )
         if not controller.initialize(list(INIT_STEPS)):
             raise TimeoutError(f"Drone {did}: MAVLink init sequence timed out.")
         controller.start_rc_keepalive()
@@ -395,6 +419,7 @@ def _bootstrap_altitude_separation(controllers: List[DroneController], *, anchor
 def _control_loop(
     controller: DroneController,
     *,
+    decision_reader: PassiveEstimatedPositionReader,
     anchor_id: int,
     duration_s: float,
     r_vis_m: float,
@@ -416,12 +441,12 @@ def _control_loop(
         if duration_s > 0 and (time.time() - START_TIME) >= duration_s:
             return
 
-        my_pos = _pos_common(controller)
+        my_pos = decision_reader.get_position(did)
         others = controller.get_other_drones_positions()
         anchor_pos = my_pos if did == int(anchor_id) else others.get(int(anchor_id))
-        vx, vy, vz = _ned_velocity(controller)
+        vx, vy, vz = _estimated_velocity(my_pos)
 
-        if anchor_pos is None:
+        if my_pos is None or anchor_pos is None:
             controller._antena_telemetry = {
                 "sigma_x": 0.0,
                 "sigma_y": 0.0,
@@ -534,6 +559,36 @@ def main() -> None:
     parser.add_argument("--experiment-dir", type=str, default=None)
     parser.add_argument("--run-id", type=str, default=None)
     parser.add_argument("--log-hz", type=float, default=20.0)
+    compare_group = parser.add_mutually_exclusive_group()
+    compare_group.add_argument(
+        "--compare-mavlink-log",
+        dest="compare_mavlink_log",
+        action="store_true",
+        default=True,
+        help="Enable passive tap2 MAVLink comparison CSV logs.",
+    )
+    compare_group.add_argument(
+        "--no-compare-mavlink-log",
+        dest="compare_mavlink_log",
+        action="store_false",
+        help="Disable passive tap2 MAVLink comparison CSV logs.",
+    )
+    parser.add_argument("--compare-mavlink-port-base", type=int, default=14751)
+    parser.add_argument("--compare-mavlink-hz", type=float, default=20.0)
+    parser.add_argument(
+        "--decision-position-source",
+        type=str,
+        default="local",
+        choices=["local", "global"],
+        help="Estimated-position source for swarm decisions: LOCAL_POSITION_NED or GLOBAL_POSITION_INT.",
+    )
+    parser.add_argument(
+        "--decision-mavlink-port-base",
+        type=int,
+        default=14651,
+        help="UDP tap port base for passive decision telemetry; drone N uses base+(N-1)*10.",
+    )
+    parser.add_argument("--decision-mavlink-hz", type=float, default=20.0)
     parser.add_argument(
         "--log-mode",
         type=str,
@@ -553,6 +608,15 @@ def main() -> None:
         parser.error("--z-pwm-max must be positive.")
     if int(args.z_pwm_min_step) < 0:
         parser.error("--z-pwm-min-step must be non-negative.")
+    if bool(args.compare_mavlink_log):
+        if int(args.compare_mavlink_port_base) <= 0:
+            parser.error("--compare-mavlink-port-base must be positive.")
+        if float(args.compare_mavlink_hz) <= 0:
+            parser.error("--compare-mavlink-hz must be positive.")
+    if int(args.decision_mavlink_port_base) <= 0:
+        parser.error("--decision-mavlink-port-base must be positive.")
+    if float(args.decision_mavlink_hz) <= 0:
+        parser.error("--decision-mavlink-hz must be positive.")
 
     num_drones = max(1, int(args.drones))
     anchor_id = int(args.anchor_id)
@@ -564,12 +628,26 @@ def main() -> None:
     ]
     controllers: List[DroneController] = [DroneController(cfg, logging_enabled=False) for cfg in drones_config]
 
+    decision_reader = PassiveEstimatedPositionReader(
+        drone_ids=[int(cfg["id"]) for cfg in drones_config],
+        position_source=str(args.decision_position_source),
+        port_base=int(args.decision_mavlink_port_base),
+        hz=float(args.decision_mavlink_hz),
+        heartbeat_timeout_s=float(args.heartbeat_timeout),
+        home_y_offset_step_m=float(_HOME_Y_OFFSET_STEP_M),
+    )
+    decision_reader.start()
+
     init_barrier = threading.Barrier(len(controllers) + 1)
     for c in controllers:
         threading.Thread(
             target=initialize_drone_parallel,
             args=(c, init_barrier),
-            kwargs={"heartbeat_timeout_s": float(args.heartbeat_timeout), "position_timeout_s": 10.0},
+            kwargs={
+                "decision_reader": decision_reader,
+                "heartbeat_timeout_s": float(args.heartbeat_timeout),
+                "position_timeout_s": 10.0,
+            },
             daemon=False,
         ).start()
 
@@ -578,6 +656,7 @@ def main() -> None:
     except threading.BrokenBarrierError:
         logger.error("[fntena_logic_copy2] Init barrier broken; stopping.")
         _stop_all(controllers)
+        decision_reader.close()
         return
 
     time.sleep(2.0)
@@ -601,6 +680,18 @@ def main() -> None:
         f.write(CSV_HEADER_ANTENA_TELEMETRY + "\n")
         f.flush()
         experiment_log_files[did] = f
+
+    compare_logger: Optional[PassiveMAVLinkCompareLogger] = None
+    compare_log_dir = os.path.join(experiment_dir, "mavlink_compare")
+    if bool(args.compare_mavlink_log):
+        compare_logger = PassiveMAVLinkCompareLogger(
+            experiment_dir=experiment_dir,
+            drone_ids=[int(cfg["id"]) for cfg in drones_config],
+            port_base=int(args.compare_mavlink_port_base),
+            hz=float(args.compare_mavlink_hz),
+            heartbeat_timeout_s=float(args.heartbeat_timeout),
+        )
+        compare_logger.start()
 
     write_metadata(
         experiment_dir,
@@ -633,9 +724,19 @@ def main() -> None:
             "bootstrap_alt_separation_sec": float(BOOTSTRAP_ALT_SEPARATION_SEC),
             "bootstrap_base_pwm": int(BOOTSTRAP_BASE_PWM),
             "bootstrap_step_pwm": int(BOOTSTRAP_STEP_PWM),
+            "compare_mavlink_log_enabled": bool(args.compare_mavlink_log),
+            "compare_mavlink_port_base": int(args.compare_mavlink_port_base),
+            "compare_mavlink_hz": float(args.compare_mavlink_hz),
+            "compare_mavlink_directory": compare_log_dir if bool(args.compare_mavlink_log) else "",
+            "decision_position_source": str(args.decision_position_source),
+            "decision_mavlink_port_base": int(args.decision_mavlink_port_base),
+            "decision_mavlink_hz": float(args.decision_mavlink_hz),
+            "decision_mavlink_heartbeat_timeout_s": float(args.heartbeat_timeout),
         },
     )
     logger.info("[fntena_logic_copy2] Logging RViz replay CSVs to: %s", experiment_dir)
+    if compare_logger is not None:
+        logger.info("[fntena_logic_copy2] Logging MAVLink compare CSVs to: %s", compare_log_dir)
 
     def exchange_loop() -> None:
         last_pub = 0.0
@@ -652,9 +753,10 @@ def main() -> None:
             for c in controllers:
                 did = int(c.config["id"])
                 pos_common[did] = _pos_common(c)
+            estimated_common = decision_reader.get_positions()
             for c in controllers:
                 my_id = int(c.config["id"])
-                for did, pos in pos_common.items():
+                for did, pos in estimated_common.items():
                     if did != my_id:
                         c.update_other_drone_position(did, pos)
             now = time.time()
@@ -679,6 +781,7 @@ def main() -> None:
                             att = att
                     try:
                         tm = getattr(c, "_antena_telemetry", {}) or {}
+                        sim_vx, sim_vy, sim_vz = _ned_velocity(c)
                         write_row_antena_telemetry(
                             experiment_log_files[did],
                             did,
@@ -698,9 +801,9 @@ def main() -> None:
                             rc_pitch=int(tm.get("rc_pitch", RC_NEUTRAL)),
                             rc_throttle=int(tm.get("rc_throttle", RC_NEUTRAL)),
                             rc_yaw=int(tm.get("rc_yaw", RC_NEUTRAL)),
-                            vx=float(tm.get("vx", 0.0)),
-                            vy=float(tm.get("vy", 0.0)),
-                            vz=float(tm.get("vz", 0.0)),
+                            vx=sim_vx,
+                            vy=sim_vy,
+                            vz=sim_vz,
                         )
                     except Exception:
                         pass
@@ -718,6 +821,7 @@ def main() -> None:
                                 att = att
                         try:
                             tm = getattr(c, "_antena_telemetry", {}) or {}
+                            sim_vx, sim_vy, sim_vz = _ned_velocity(c)
                             write_row_antena_telemetry(
                                 experiment_log_files[did],
                                 did,
@@ -737,9 +841,9 @@ def main() -> None:
                                 rc_pitch=int(tm.get("rc_pitch", RC_NEUTRAL)),
                                 rc_throttle=int(tm.get("rc_throttle", RC_NEUTRAL)),
                                 rc_yaw=int(tm.get("rc_yaw", RC_NEUTRAL)),
-                                vx=float(tm.get("vx", 0.0)),
-                                vy=float(tm.get("vy", 0.0)),
-                                vz=float(tm.get("vz", 0.0)),
+                                vx=sim_vx,
+                                vy=sim_vy,
+                                vz=sim_vz,
                             )
                         except Exception:
                             pass
@@ -764,6 +868,7 @@ def main() -> None:
             target=_control_loop,
             args=(c,),
             kwargs={
+                "decision_reader": decision_reader,
                 "anchor_id": anchor_id,
                 "duration_s": duration_s,
                 "r_vis_m": float(args.r_vis),
@@ -789,6 +894,9 @@ def main() -> None:
     finally:
         STOP_EVENT.set()
         _stop_all(controllers)
+        decision_reader.close()
+        if compare_logger is not None:
+            compare_logger.close()
         for _did, f in experiment_log_files.items():
             try:
                 f.close()

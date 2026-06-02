@@ -95,8 +95,14 @@ SCENARIOS: List[Tuple[str, str, str, str]] = [
     ),
     (
         "fntena_logic_copy2",
-        "Fntena logic (copy2, grid_antenna-like): bang-bang σ on x/y/z",
+        "Fntena logic (copy2, grid_antenna-like): continuous σ PWM on x/y, PI z",
         "scenarios/fntena_logic_copy2.py",
+        project_root,
+    ),
+    (
+        "fntena_logic_copy2_shum",
+        "Fntena logic copy2 shum: MAVLink compare/noise experiment",
+        "scenarios/fntena_logic_copy2_shum.py",
         project_root,
     ),
     (
@@ -141,6 +147,7 @@ SCENARIO_MIN_DRONES: Dict[str, int] = {
     "antena_logic": 1,
     "antena_logic_copy": 1,
     "fntena_logic_copy2": 1,
+    "fntena_logic_copy2_shum": 1,
 }
 
 # Many parallel MAVProxy + ArduCopter SITL processes need more spacing; otherwise CPU / IO
@@ -362,6 +369,7 @@ def start_sitl_webots(
         tcp_port = BASE_TCP + i * 10
         udp_port = SITL_BASE_UDP_PORT + i * SITL_UDP_PORT_STEP
         udp_tap = udp_port + SITL_UDP_LOGGER_TAP_OFFSET
+        udp_tap2 = udp_port + SITL_UDP_LOGGER_TAP2_OFFSET
         home_str = _sitl_home_for_drone(i)
         args = [
             sys.executable,
@@ -373,6 +381,7 @@ def start_sitl_webots(
             f"--out=127.0.0.1:{tcp_port}",
             f"--out=127.0.0.1:{udp_port}",
             f"--out=127.0.0.1:{udp_tap}",
+            f"--out=127.0.0.1:{udp_tap2}",
             "-l", home_str,
         ]
         if sitl_console:
@@ -380,11 +389,12 @@ def start_sitl_webots(
         if extra:
             args.extend(extra)
         logger.info(
-            "[SITL] instance=%s, TCP=%s, UDP=%s (scenario), tap=%s, location=%s",
+            "[SITL] instance=%s, TCP=%s, UDP=%s (scenario), tap=%s, tap2=%s, location=%s",
             i,
             tcp_port,
             udp_port,
             udp_tap,
+            udp_tap2,
             home_str,
         )
         proc = subprocess.Popen(args, cwd=cwd)
@@ -570,7 +580,36 @@ Examples:
         choices=["timer", "mavlink"],
         help=(
             "Scenario-specific: CSV logging mode. Currently forwarded only to "
-            "scenarios 'antena_logic' and 'antena_logic_copy' as --log-mode."
+            "scenarios 'antena_logic', 'antena_logic_copy', "
+            "'fntena_logic_copy2', and 'fntena_logic_copy2_shum' as --log-mode."
+        ),
+    )
+    parser.add_argument(
+        "--decision-position-source",
+        type=str,
+        default=None,
+        choices=["local", "global"],
+        help=(
+            "Scenario-specific for fntena_logic_copy2_shum: use LOCAL_POSITION_NED "
+            "or GLOBAL_POSITION_INT for swarm decisions."
+        ),
+    )
+    parser.add_argument(
+        "--decision-mavlink-port-base",
+        type=int,
+        default=None,
+        help=(
+            "Scenario-specific for fntena_logic_copy2_shum: UDP tap port base "
+            "for decision telemetry."
+        ),
+    )
+    parser.add_argument(
+        "--decision-mavlink-hz",
+        type=float,
+        default=None,
+        help=(
+            "Scenario-specific for fntena_logic_copy2_shum: requested decision "
+            "telemetry rate."
         ),
     )
     parser.add_argument(
@@ -772,8 +811,21 @@ Examples:
     if exchange_hz > 0:
         scenario_cmd.extend(["--exchange-hz", str(exchange_hz)])
     # Forward scenario-specific args only when supported by that scenario.
-    if scenario_id in ("antena_logic", "antena_logic_copy") and getattr(args, "log_mode", None):
+    if scenario_id in ("antena_logic", "antena_logic_copy", "fntena_logic_copy2", "fntena_logic_copy2_shum") and getattr(args, "log_mode", None):
         scenario_cmd.extend(["--log-mode", str(args.log_mode)])
+    if scenario_id == "fntena_logic_copy2_shum":
+        if getattr(args, "decision_position_source", None):
+            scenario_cmd.extend(
+                ["--decision-position-source", str(args.decision_position_source)]
+            )
+        if getattr(args, "decision_mavlink_port_base", None) is not None:
+            scenario_cmd.extend(
+                ["--decision-mavlink-port-base", str(args.decision_mavlink_port_base)]
+            )
+        if getattr(args, "decision_mavlink_hz", None) is not None:
+            scenario_cmd.extend(
+                ["--decision-mavlink-hz", str(args.decision_mavlink_hz)]
+            )
     scenario_proc = subprocess.Popen(
         scenario_cmd,
         cwd=scenario_cwd,

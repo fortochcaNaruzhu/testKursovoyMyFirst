@@ -1,0 +1,810 @@
+% Математическая модель дрона и окружения в Anatoliy/swarm_mavic.
+% Сборка: pdflatex swarm_mavic_physics_model.ru.tex
+%
+% Источники:
+%   Anatoliy/swarm_mavic/controllers/swarm_python/point_mass.py
+%   Anatoliy/swarm_mavic/controllers/swarm_python/point_mass_acc_mod.py
+%   Anatoliy/swarm_mavic/controllers/swarm_python/swarm_python.py
+%   Anatoliy/swarm_mavic/controllers/swarm_python_crazyflie/pid_controller.py
+%   Anatoliy/swarm_mavic/worlds/*.wbt
+
+\documentclass[a4paper,11pt]{article}
+
+\usepackage[T2A]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[russian]{babel}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{bm}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\setlist{nosep,leftmargin=*}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\vect}[1]{\bm{#1}}
+\newcommand{\mat}[1]{\bm{#1}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\sgn}{\operatorname{sgn}}
+
+\title{Математическая модель дрона и окружения\\
+в проекте \code{Anatoliy/swarm\_mavic}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Документ описывает физическую и математическую модель, используемую
+в проекте \textbf{Anatoliy/swarm\_mavic} для исследования распределённого
+роевого управления. Проект содержит \textbf{два уровня моделирования}:
+(1)~офлайн-симулятор материальных точек на Python с явной интеграцией
+и релейным законом по переменным $\sigma$; (2)~симулятор \textbf{Webots R2023b}
+с полной 6-DOF динамикой роботов DJI Mavic~2 Pro и Bitcraze Crazyflie,
+где ройевой закон преобразуется в возмущения ориентации/высоты или
+желаемые ускорения, а низкоуровневый PID выдаёт скорости моторов.
+Даны уравнения движения, схема интегрирования, модель восприятия соседей,
+формулы якорей и параметры миров Webots.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%====================================================================
+\section{Архитектура модели в swarm\_mavic}
+%====================================================================
+
+Проект \code{Anatoliy/swarm\_mavic} предназначен для отработки
+\textbf{распределённых алгоритмов роевого управления} (sigma/sliding-mode
+стиль) в двух режимах:
+
+\begin{enumerate}
+  \item \textbf{Офлайн Python} (\code{controllers/swarm\_python/},
+  \code{corridor\_sweeping/}, \code{grid\_antenna/}):
+  агенты --- материальные точки с кастомной динамикой; окружение ---
+  математическое (якоря, ветер, заданные траектории); интеграция ---
+  явная схема на шаге $\Delta t$.
+  \item \textbf{Webots} (\code{worlds/*.wbt}, контроллеры
+  \code{swarm\_python}, \code{swarm\_python\_crazyflie},
+  \code{crazyflie\_swarm\_acc}):
+  физика 6-DOF делегирована движку Webots; ройевой закон задаёт
+  возмущения или ускорения; каскадный PID переводит их в
+  \code{setVelocity} на пропеллерах.
+\end{enumerate}
+
+\paragraph{Связь с Kursov3.}
+В репозитории Kursov3 основной симулятор ---
+\code{Drone\_Swarm\_Simulator\_v2} (ArduPilot SITL + Webots).
+Проект \code{swarm\_mavic} --- отдельный блок наработок с той же
+\emph{математической идеей} ройевого закона ($\xi=\tanh$, $\sigma$, релей),
+но другой реализацией физики: упрощённая точечная модель в Python
+и нативная физика Webots для Mavic/Crazyflie.
+
+\paragraph{Цепочка вычислений (офлайн).}
+\begin{enumerate}
+  \item Для каждого агента $i$: собрать множество видимых соседей
+  $\mathcal{P}_i$ в радиусе $R_{\mathrm{vis}}$.
+  \item Вычислить шесть скалярных «зазоров'' $d_x^\pm, d_y^\pm, d_z^\pm$
+  по проекциям относительных векторов.
+  \item Построить $\sigma_x, \sigma_y, \sigma_z$ и релейное управление
+  $\vect{u}_i$.
+  \item Интегрировать $\vect{p}_i, \vect{v}_i$ по \eqref{eq:pm_accel}--\eqref{eq:pm_pos}.
+\end{enumerate}
+
+\paragraph{Цепочка вычислений (Webots).}
+\begin{enumerate}
+  \item Supervisor читает позиции других роботов (и якоря).
+  \item Тот же алгоритм зазоров $\Rightarrow$ возмущения roll/pitch/yaw/alt
+  (Mavic) или $a_{des}$ (Crazyflie acc).
+  \item PID + motor mixing $\Rightarrow$ $\omega_k$ на моторах.
+  \item Webots интегрирует жёсткое тело за $\Delta t_{\mathrm{WB}}=8$~мс.
+\end{enumerate}
+
+%====================================================================
+\section{Системы координат и состояние}
+%====================================================================
+
+\subsection{Глобальная система (World)}
+
+Во всех сценариях используется \textbf{правая декартова система}:
+\begin{itemize}
+  \item ось $X$ --- горизонталь (м);
+  \item ось $Y$ --- горизонталь, перпендикулярная $X$ (м);
+  \item ось $Z$ --- \textbf{вверх} (высота, м).
+\end{itemize}
+
+Webots GPS: \code{gps.getValues()} $\to (x, y, z)$, где $z$ --- altitude.
+Python: \code{pose = [x, y, z]}.
+
+Положение агента $i$:
+\[
+  \vect{p}_i = (p_{ix}, p_{iy}, p_{iz})^\top \in \R^3.
+\]
+Скорость: $\vect{v}_i = \dot{\vect{p}}_i$ (в коде \code{dpose}).
+
+\subsection{Относительные координаты соседей}
+
+Для фокусного агента $i$ и объекта $j$ (агент или якорь):
+\begin{equation}
+  \vect{r}_{ij} = \vect{p}_j - \vect{p}_i.
+  \label{eq:rel_vec}
+\end{equation}
+Агент «видит'' $j$, если $\norm{\vect{r}_{ij}} \le R_{\mathrm{vis}}$.
+
+\subsection{Разложение по шести полупространствам}
+
+Для каждого $\vect{r}=(r_x,r_y,r_z)^\top \in \mathcal{P}_i$ вычисляются
+\textbf{минимальные положительные проекции} по осям (не евклидовы расстояния):
+\begin{align}
+  d_x^+ &= \min\{\, r_x \;:\; \vect{r}\in\mathcal{P}_i,\; r_x \ge 0 \,\}, &
+  d_x^- &= \min\{\, |r_x| \;:\; \vect{r}\in\mathcal{P}_i,\; r_x < 0 \,\}, \label{eq:dx}\\
+  d_y^+ &= \min\{\, r_y \;:\; r_y \ge 0 \,\}, &
+  d_y^- &= \min\{\, |r_y| \;:\; r_y < 0 \,\}, \label{eq:dy}\\
+  d_z^+ &= \min\{\, r_z \;:\; r_z \ge 0 \,\}, &
+  d_z^- &= \min\{\, |r_z| \;:\; r_z < 0 \,\}. \label{eq:dz}
+\end{align}
+Если множество пусто, в коде значение остаётся $\infty$ (\code{np.inf}),
+а булев флаг «сосед есть'' --- ложным.
+
+\subsection{Связанная система (Webots, Crazyflie)}
+
+Глобальная скорость $(v_x^{glob}, v_y^{glob})$ проецируется в продольную/
+поперечную относительно yaw $\psi$:
+\begin{equation}
+  v_x = v_x^{glob}\cos\psi + v_y^{glob}\sin\psi,\qquad
+  v_y = -v_x^{glob}\sin\psi + v_y^{glob}\cos\psi.
+  \label{eq:body_vel}
+\end{equation}
+Mavic использует roll/pitch/yaw напрямую из IMU (\code{InertialUnit}).
+
+\subsection{Состояние агента (офлайн)}
+
+Минимальный набор для \code{PointMass}:
+\begin{align*}
+  \text{положение:} &\quad \vect{p}_i(t), \\
+  \text{скорость:} &\quad \vect{v}_i(t), \\
+  \text{сила/управление:} &\quad \vect{F}_i(t) \equiv \vect{u}_i(t), \\
+  \text{дискретное время:} &\quad t_n = n\,\Delta t,\; n=0,1,\ldots.
+\end{align*}
+Ориентация и угловая скорость \textbf{не моделируются} в 3D point-mass.
+
+%====================================================================
+\section{Динамика материальной точки (PointMass)}
+%====================================================================
+
+Класс \code{PointMass} (\code{point\_mass.py}) --- основа офлайн-симуляции.
+
+\subsection{Уравнение движения}
+
+Суммарное ускорение:
+\begin{equation}
+  \vect{a}_i = \frac{\vect{F}_i}{m_i} + \frac{\vect{F}_i^{\mathrm{ext}}}{m_i},
+  \label{eq:pm_accel}
+\end{equation}
+где:
+\begin{itemize}
+  \item $m_i$ --- масса агента (кг); по умолчанию $m_i = 1$;
+  \item $\vect{F}_i$ --- управляющая сила (\code{apply\_force});
+  \item $\vect{F}_i^{\mathrm{ext}}$ --- внешнее возмущение (ветер), опционально.
+\end{itemize}
+
+\textbf{Важно.} При $m_i=1$ управление $\vect{u}_i$ numerically совпадает
+с ускорением (Н = кг\,м/с$^2$ при $m=1$). Гравитация в 3D \code{PointMass}
+\textbf{не включается}.
+
+\subsection{Схема интегрирования}
+
+На шаге $\Delta t$ (\code{step}):
+\begin{align}
+  \vect{v}_i(t+\Delta t) &= \vect{v}_i(t) + \vect{a}_i(t)\,\Delta t,
+  \label{eq:pm_vel}\\
+  \vect{p}_i(t+\Delta t) &= \vect{p}_i(t) + \vect{v}_i(t)\,\Delta t
+  + \tfrac{1}{2}\vect{a}_i(t)\,(\Delta t)^2.
+  \label{eq:pm_pos}
+\end{align}
+
+Это модифицированный явный Эйлер для скорости и схема с квадратичным
+членом по ускорению для положения (Verlet-подобная).
+
+\paragraph{Параметры по умолчанию.}
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Параметр} & \textbf{Код} & \textbf{Значение} \\
+\hline
+$m$ & \code{mass} & 1.0 \\
+$R_{\mathrm{vis}}$ & \code{R\_vis} & 3.0 м \\
+$\Delta t$ & \code{dt} & 0.01--0.02 с \\
+\hline
+\end{tabular}
+\end{center}
+
+%====================================================================
+\section{Одномерная модель с трением (Agent\_1D)}
+%====================================================================
+
+Сценарий \code{cruise.py} использует агентов на криволинейной траектории
+с параметром $s$ (длина дуги).
+
+\subsection{Уравнение}
+
+\begin{equation}
+  \ddot{s} = \frac{u}{m} - k_f \dot{s} - g_\parallel,
+  \label{eq:1d}
+\end{equation}
+где:
+\begin{itemize}
+  \item $s$ --- скалярная координата вдоль траектории (м);
+  \item $k_f = 0.01$ --- коэффициент вязкого трения (1/с);
+  \item $g = 0.981$ м/с$^2$ --- модуль «гравитации'';
+  \item $g_\parallel = g\sin\phi$ --- проекция на касательную к траектории.
+\end{itemize}
+
+\subsection{Пространственная кривая}
+
+Задана параметрически через $s$:
+\begin{equation}
+  \vect{r}(s) = \bigl(8\cos s,\; 8\sin s,\; \sin(3s)\bigr)^\top \ \text{м}.
+  \label{eq:spatial_curve}
+\end{equation}
+Касательная: $\vect{r}'(s)$; угол наклона:
+\[
+  \sin\phi = \frac{dz/ds}{\norm{d\vect{r}/ds}},\qquad
+  \norm{d\vect{r}/ds} = \sqrt{64 + 9\cos^2(3s)}.
+\]
+Связь параметра $s$ и времени $t$ задаётся через интеграл длины дуги
+(\code{forward\_integrate}, файл \code{t\_interpolator.bin}).
+
+Интегрирование --- та же схема \eqref{eq:pm_vel}--\eqref{eq:pm_pos}
+для скаляра $s$.
+
+%====================================================================
+\section{Модель якорей (kinematic)}
+%====================================================================
+
+Якоря --- \textbf{неуправляемые опорные точки} без динамики.
+Три реализации:
+
+\subsection{Дискретная траектория (Anchor)}
+
+\begin{equation}
+  \vect{p}_A(n) = \vect{T}\bigl[n \bmod N\bigr],
+  \label{eq:anchor_disc}
+\end{equation}
+где $\vect{T}$ --- массив поз из файла \code{*.txt}.
+
+\subsection{Непрерывная функция (AnchorWithFunc)}
+
+\begin{equation}
+  \vect{p}_A(t) = \vect{f}(t),\qquad t \leftarrow t + \Delta t.
+  \label{eq:anchor_func}
+\end{equation}
+
+Пример коридора (\code{corridor\_sweeping/main.py}):
+\begin{align}
+  \vect{p}_L(t) &= (v_x t,\; y_L,\; 0)^\top, &
+  \vect{p}_R(t) &= (v_x t,\; y_R,\; 0)^\top, \label{eq:corridor_anchors}\\
+  v_x &= 0.03\ \text{м/с},\quad y_L = 2,\quad y_R = -2. \nonumber
+\end{align}
+
+\subsection{Предопределённые траектории сетки (scene\_creator.py)}
+
+\begin{itemize}
+  \item \textbf{Вращающаяся линия:}
+  $x_i = i\,\Delta\cos\theta(t),\; y_i = i\,\Delta\sin\theta(t),\; z=0$;
+  \item \textbf{Статический синус:}
+  $y = 5\sin(2\pi x/18)$, $z=1$;
+  \item \textbf{Скользящая линия:}
+  $x = 0.002t - 10$, $y_i = i - 5$, $z=1$;
+  \item \textbf{Круг в $Oxy$:}
+  $x = 4\cos t,\; y = 4\sin t,\; z=1$.
+\end{itemize}
+
+%====================================================================
+\section{Распределённый закон управления}
+%====================================================================
+
+Общий для Python и Webots (с разными выходными отображениями).
+
+\subsection{Нелинейность и функция зазора}
+
+\begin{equation}
+  \xi(g) = \tanh(g).
+  \label{eq:xi}
+\end{equation}
+
+\begin{equation}
+  g(d,\, g_0,\, h) =
+  \begin{cases}
+    d,   & h = \text{true (сосед есть)}, \\
+    g_0, & h = \text{false}.
+  \end{cases}
+  \label{eq:g}
+\end{equation}
+
+По осям $x,y$ при отсутствии соседа: $g_0 = 0$.
+По оси $z$: $g_0 = w$ (желаемый вертикальный зазор, м).
+
+\subsection{Переменные скольжения $\sigma$}
+
+\begin{align}
+  \sigma_x &= v_x - \xi\!\bigl(g(d_x^+,\, 0,\, h_x^+)\bigr)
+  + \xi\!\bigl(g(d_x^-,\, 0,\, h_x^-)\bigr), \label{eq:sigma_x}\\
+  \sigma_y &= v_y - \xi\!\bigl(g(d_y^+,\, 0,\, h_y^+)\bigr)
+  + \xi\!\bigl(g(d_y^-,\, 0,\, h_y^-)\bigr), \label{eq:sigma_y}\\
+  \sigma_z &= v_z - \xi\!\bigl(g(d_z^+,\, w,\, h_z^+)\bigr)
+  + \xi\!\bigl(g(d_z^-,\, w,\, h_z^-)\bigr). \label{eq:sigma_z}
+\end{align}
+
+\subsection{Релейное (bang-bang) управление}
+
+\begin{equation}
+  u_k = -u_{\max}\,\sgn(\sigma_k),\qquad k \in \{x,y,z\}.
+  \label{eq:relay}
+\end{equation}
+\begin{equation}
+  \sgn(\sigma) =
+  \begin{cases}
+    +1, & \sigma \ge 0, \\
+    -1, & \sigma < 0.
+  \end{cases}
+  \label{eq:sign}
+\end{equation}
+
+В \code{corridor\_sweeping} по $z$ управление обнуляется: $u_z = 0$.
+
+\subsection{Состояние восприятия peer\_state}
+
+\begin{itemize}
+  \item $s_i = 0$: нет видимых агентов и якорей;
+  \item $s_i = 1$: есть хотя бы один видимый агент;
+  \item $s_i = 2$: в зоне видимости есть якорь.
+\end{itemize}
+При нескольких соседях: $s_i \leftarrow \max(s_i, s_j)$ для видимых $j$.
+
+\subsection{Подстановка при отсутствии соседа (prior knowledge)}
+
+В Webots (\code{crazyflie\_swarm\_acc}) при пустом направлении:
+\begin{itemize}
+  \item если знак к якорю отрицателен: $d_k = 0$ (гориз.) или $w$ ($z$);
+  \item иначе: $d_k = R_{\mathrm{vis}}$ (верхняя граница зоны).
+\end{itemize}
+
+%====================================================================
+\section{Внешние возмущения и ветер}
+%====================================================================
+
+В \code{point\_mass\_acc\_mod.py} задаётся постоянная внешняя сила:
+\begin{equation}
+  \vect{F}^{\mathrm{ext}} = (f_x,\, f_y,\, f_z)^\top,
+  \label{eq:wind}
+\end{equation}
+типично $f_y = f_z = 0$, $f_x \in [0.1,\, 9.5]$ (параметр \code{wind\_f\_x}).
+
+В 3D point-mass гравитация отсутствует; «ветер'' --- единственное
+моделируемое поле среды в Python.
+
+%====================================================================
+\section{Инициализация роя (цепочка на сфере)}
+%====================================================================
+
+Агенты размещаются последовательной цепочкой (\code{process},
+\code{chain\_initialization}):
+\begin{align}
+  \Delta_i &\sim \mathcal{U}(R_{\min},\, R_{\mathrm{vis}}), &
+  \alpha_i, \beta_i &\sim \mathcal{N}(0,\, \sigma_\alpha^2),\, \mathcal{N}(0,\, \sigma_\beta^2), \nonumber\\
+  x_i &= x_{i-1} + \Delta_i \sin\beta_i, \nonumber\\
+  y_i &= y_{i-1} - \Delta_i \sin\alpha_i \cos\beta_i, \nonumber\\
+  z_i &= z_{i-1} + \Delta_i \cos\alpha_i \cos\beta_i. \label{eq:chain_init}
+\end{align}
+Типично: $R_{\min}=1.0$ м, $\sigma_\alpha = \sigma_\beta = 0.8$.
+
+%====================================================================
+\section{Сценарии и параметры экспериментов}
+%====================================================================
+
+\subsection{Общий 3D рой (\code{point\_mass\_acc\_mod.py})}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|c|l|}
+\hline
+\textbf{Параметр} & \textbf{Значение} & \textbf{Смысл} \\
+\hline
+$N$ & задаётся & число агентов \\
+$R_{\mathrm{vis}}$ & 3.0 м & радиус видимости \\
+$w$ & 0.5 м & вертикальный зазор \\
+$u_{\max}$ & 1.0 & насыщение управления \\
+$\Delta t$ & 0.01--0.001 с & шаг интегрирования \\
+$n_{\mathrm{iters}}$ & $10^4$--$10^5$ & число шагов \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Коридор (\code{corridor\_sweeping/main.py})}
+
+Два якоря \eqref{eq:corridor_anchors}, управление 2D ($u_z=0$).
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|c|}
+\hline
+$n_{\mathrm{agents}}$ & 5 \\
+$R_{\mathrm{vis}}$ & 3.0 м \\
+$w$ & 1.0 м \\
+$u_{\max}$ & 10.0 \\
+$\Delta t$ & 0.01 с \\
+$n_{\mathrm{iters}}$ & 20000 \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Сетка антенны (\code{grid\_antenna/main.py})}
+
+Структура: $N_{\mathrm{anchors}} \times N_{\mathrm{agents/family}}$.
+Каждый агент привязан к \code{family\_id} и следует своему якорю.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|c|l|}
+\hline
+\textbf{Параметр} & \textbf{Значение} & \textbf{Примечание} \\
+\hline
+Сцена & \code{xz\_grid\_10x10} & 10$\times$10 \\
+$R_{\mathrm{vis}}$ (агенты) & 2.5 м & \\
+$u_{\max}$ (агенты) & 3.0 & \\
+$w$ (агенты) & 0.5 м & \\
+$R_{\mathrm{vis}}$ (якоря) & 2.0 м & \\
+$w$ (якоря) & 1.0 м & \\
+$\Delta t$ & 0.02 с & \\
+Точка притяжения & $(0,0,1)$ & для якорей \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Крейсер по кривой (\code{cruise.py})}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|c|}
+\hline
+$R_{\mathrm{vis}}$ & 1.0 м \\
+$w$ & 0.5 м \\
+$u_{\max}$ & 20.0 \\
+$g$ & 0.981 м/с$^2$ \\
+$k_f$ & 0.01 \\
+\hline
+\end{tabular}
+\end{center}
+
+%====================================================================
+\section{Окружение Webots}
+%====================================================================
+
+\subsection{Файлы миров}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Мир} & \textbf{Робот} & \textbf{Контроллер} \\
+\hline
+\code{swarm.wbt} & Mavic2Pro ($\times$10) & \code{swarm\_python} \\
+\code{swarm\_crazyflie.wbt} & Crazyflie ($\times$10) & \code{swarm\_python\_crazyflie} \\
+\code{crazyflie\_swarm\_acc.wbt} & Crazyflie ($\times$5+) & \code{crazyflie\_swarm\_acc} \\
+\code{single\_anchor\_linear.wbt} & Crazyflie & \code{anchor}+\code{agent} \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{WorldInfo и физика}
+
+Из \code{worlds/swarm.wbt}:
+\begin{itemize}
+  \item \code{basicTimeStep} = 8 (мс) $\Rightarrow$ $\Delta t_{\mathrm{WB}} = 0.008$ с;
+  \item \code{defaultDamping}: linear = 0.5, angular = 0.5;
+  \item гравитация: значение по умолчанию Webots $\approx 9.81$ м/с$^2$;
+  \item пол (\code{Floor}): асфальт, размер до 200$\times$164 м;
+  \item препятствий и ветра в мирах \textbf{нет}.
+\end{itemize}
+
+Webots решает уравнения \textbf{6-DOF жёсткого тела} с внутренней
+моделью пропеллеров (\code{Mavic2Pro.proto}, \code{Crazyflie.proto}
+из дистрибутива Cyberbotics). Масса, инерция и аэродинамика
+\textbf{не задаются} в репозитории --- берутся из PROTO-файлов Webots.
+
+\subsection{Демпфирование Webots}
+
+Линейное и угловое демпфирование по умолчанию:
+\begin{equation}
+  \vect{F}_{\mathrm{damp}} = -d_l\,\vect{v},\qquad
+  \vect{\tau}_{\mathrm{damp}} = -d_a\,\vect{\omega},\qquad
+  d_l = d_a = 0.5.
+  \label{eq:wb_damp}
+\end{equation}
+(точная реализация --- в ODE Webots; коэффициенты из \code{WorldInfo}).
+
+%====================================================================
+\section{Низкоуровневое управление: DJI Mavic 2 Pro}
+%====================================================================
+
+Контроллер \code{swarm\_python.py}. Ройевой закон выдаёт
+\textbf{возмущения} roll/pitch/yaw и целевую высоту; стабилизация ---
+PD по IMU + кубический закон высоты + motor mixing.
+
+\subsection{От зазоров к возмущениям (режим rpy)}
+
+Ошибки по горизонтали:
+\begin{equation}
+  e_x = d_x^+ - d_x^-,\qquad e_y = d_y^+ - d_y^-.
+\end{equation}
+Целевой yaw и ошибка:
+\begin{align}
+  \psi_{\mathrm{des}} &= \operatorname{atan2}(e_y,\, e_x), \label{eq:target_yaw}\\
+  e_\psi &= \psi_{\mathrm{des}} - \psi \quad \text{(нормировка в $(-\pi,\pi]$)}.
+\end{align}
+Расстояние в плоскости $d = \sqrt{e_x^2 + e_y^2}$;
+\begin{equation}
+  e_{\mathrm{roll}} = \sin(e_\psi)\,\max(d, 1),\qquad
+  e_{\mathrm{pitch}} = -\cos(e_\psi)\,\max(d, 1).
+\end{equation}
+PID/Sigma по $e_{\mathrm{roll}}$, $e_{\mathrm{pitch}}$, $e_\psi$;
+высота:
+\begin{equation}
+  h_{\mathrm{ref}} = h + u_{\mathrm{alt}}(d_z^+ - w) - u_{\mathrm{alt}}(d_z^- - w).
+\end{equation}
+
+\subsection{Стабилизация attitude и высоты}
+
+\begin{align}
+  u_{\mathrm{roll}} &= k_{r,p}\,\mathrm{clamp}(\phi)
+  + k_{r,d}\,\mathrm{clamp}(\dot\phi) + \delta_{\mathrm{roll}}, \label{eq:mavic_roll}\\
+  u_{\mathrm{pitch}} &= k_{p,p}\,\mathrm{clamp}(\theta)
+  + k_{p,d}\,\mathrm{clamp}(\dot\theta) + \delta_{\mathrm{pitch}}, \label{eq:mavic_pitch}\\
+  u_{\mathrm{yaw}} &= \delta_{\mathrm{yaw}}, \label{eq:mavic_yaw}\\
+  u_{\mathrm{vert}} &= k_{v,p}\,\mathrm{clamp}(h_{\mathrm{ref}} - h + k_{v,\mathrm{off}})^3.
+  \label{eq:mavic_vert}
+\end{align}
+
+\subsection{Motor mixing (конфигурация X)}
+
+\begin{align}
+  \omega_{FL} &= k_{\mathrm{thrust}} + u_{\mathrm{vert}} - u_{\mathrm{roll}} + u_{\mathrm{pitch}} - u_{\mathrm{yaw}}, \nonumber\\
+  \omega_{FR} &= k_{\mathrm{thrust}} + u_{\mathrm{vert}} + u_{\mathrm{roll}} + u_{\mathrm{pitch}} + u_{\mathrm{yaw}}, \nonumber\\
+  \omega_{RL} &= k_{\mathrm{thrust}} + u_{\mathrm{vert}} - u_{\mathrm{roll}} - u_{\mathrm{pitch}} + u_{\mathrm{yaw}}, \nonumber\\
+  \omega_{RR} &= k_{\mathrm{thrust}} + u_{\mathrm{vert}} + u_{\mathrm{roll}} - u_{\mathrm{pitch}} - u_{\mathrm{yaw}}.
+  \label{eq:mavic_mix}
+\end{align}
+
+Моторы в режиме \textbf{скорости}: \code{motor.setVelocity($\pm\omega$)}.
+
+\subsection{Численные коэффициенты Mavic}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|c|l|}
+\hline
+\textbf{Символ} & \textbf{Значение} & \textbf{Назначение} \\
+\hline
+$k_{\mathrm{thrust}}$ & 68.5 & базовая скорость моторов (hover) \\
+$k_{v,\mathrm{off}}$ & 0.6 & смещение высотного канала \\
+$k_{v,p}$ & 3.0 & усиление высоты \\
+$k_{r,p}$ & 50.0 & roll P \\
+$k_{p,p}$ & 30.0 & pitch P \\
+$k_{r,d}$ & 20 & roll D \\
+$k_{p,d}$ & 12 & pitch D \\
+$w$ & 1.0 м & вертикальный зазор \\
+$r_{\mathrm{perception}}$ & $\infty$ & все роботы видимы \\
+\hline
+\end{tabular}
+\end{center}
+
+%====================================================================
+\section{Низкоуровневое управление: Crazyflie}
+%====================================================================
+
+Каскадный PID (\code{pid\_controller.py}): скорость $\to$ attitude
+$\to$ моторы; высота --- PI-D.
+
+\subsection{Горизонтальная скорость}
+
+\begin{align}
+  \theta_{\mathrm{des}} &= k_p^{xy}\,\mathrm{clamp}(e_{v_x})
+  + k_d^{xy}\,\dot e_{v_x}, \label{eq:cf_pitch_des}\\
+  \phi_{\mathrm{des}} &= -k_p^{xy}\,\mathrm{clamp}(e_{v_y})
+  - k_d^{xy}\,\dot e_{v_y}, \label{eq:cf_roll_des}
+\end{align}
+где $e_{v_x} = v_{x,\mathrm{des}} - v_x$, $e_{v_y} = v_{y,\mathrm{des}} - v_y$.
+
+\subsection{Высота}
+
+\begin{equation}
+  u_{\mathrm{alt}} = k_p^z\,\mathrm{clamp}(e_h)
+  + k_d^z\,\dot e_h + k_i^z \!\int\! e_h\,dt + 48,
+  \label{eq:cf_alt}
+\end{equation}
+$e_h = h_{\mathrm{des}} - h$; «48'' --- offset hover в единицах команды моторов.
+
+\subsection{Attitude и mixing}
+
+\begin{align}
+  u_{\mathrm{roll}} &= k_p^{\mathrm{att}}\,\mathrm{clamp}(e_\phi)
+  + k_d^{\mathrm{att}}\,\dot e_\phi, \nonumber\\
+  u_{\mathrm{pitch}} &= -k_p^{\mathrm{att}}\,\mathrm{clamp}(e_\theta)
+  - k_d^{\mathrm{att}}\,\dot e_\theta, \nonumber\\
+  u_{\mathrm{yaw}} &= k_p^{\mathrm{yaw}}\,\mathrm{clamp}(e_{\dot\psi}).
+\end{align}
+
+\begin{equation}
+  m_1 = u_{\mathrm{alt}} - u_{\mathrm{roll}} + u_{\mathrm{pitch}} + u_{\mathrm{yaw}},\ \text{и циклически для } m_2,m_3,m_4.
+  \label{eq:cf_mix}
+\end{equation}
+
+\subsection{Коэффициенты Crazyflie}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|c|}
+\hline
+$k_p^{xy}$ & 5 \\
+$k_d^{xy}$ & 1.2 \\
+$k_p^z$ & 18 \\
+$k_i^z$ & 0.3 \\
+$k_d^z$ & 11 \\
+$k_p^{\mathrm{att}}$ & 0.5 \\
+$k_d^{\mathrm{att}}$ & 0.1 \\
+Hover offset & 48 \\
+\hline
+\end{tabular}
+\end{center}
+
+%====================================================================
+\section{Мост «ускорение $\to$ setpoint'' (crazyflie\_swarm\_acc)}
+%====================================================================
+
+Контроллер \code{crazyflie\_swarm\_acc.py} применяет ройевой закон
+\eqref{eq:relay} напрямую как \textbf{желаемое ускорение}
+$(a_x, a_y, a_z)$, затем двойным интегрированием получает setpoint
+для PID:
+
+\begin{align}
+  \dot h_{\mathrm{des}} &\mathrel{+}= a_z\,\Delta t, &
+  h_{\mathrm{des}} &\mathrel{+}= \dot h_{\mathrm{des}}\,\Delta t
+  + \tfrac{1}{2} a_z\,(\Delta t)^2, \label{eq:acc_int_z}\\
+  v_{f,\mathrm{des}} &\mathrel{+}= a_x\,\Delta t, &
+  v_{s,\mathrm{des}} &\mathrel{+}= a_y\,\Delta t. \label{eq:acc_int_xy}
+\end{align}
+
+Скорость в body-frame \eqref{eq:body_vel}; $\Delta t = 0.008$ с.
+RK4-функция \code{ode\_iteration} определена, но в основном цикле
+\textbf{не используется} (явный Эйлер).
+
+Параметры: $R_{\mathrm{vis}}=1.0$ м, $w=0.5$ м, $u_{\max}=0.4$.
+
+%====================================================================
+\section{Численный цикл одного шага}
+%====================================================================
+
+\subsection{Офлайн Python}
+
+\begin{enumerate}
+  \item Записать лог $(\vect{p}_i, \vect{v}_i, \vect{u}_i, s_i)$.
+  \item Обновить якоря: \eqref{eq:anchor_disc} или \eqref{eq:anchor_func}.
+  \item Для каждого живого агента $i$:
+  \begin{enumerate}
+    \item $\mathcal{P}_i \leftarrow$ видимые агенты и якоря;
+    \item $(d^\pm, h) \leftarrow$ \eqref{eq:dx}--\eqref{eq:dz};
+    \item $\sigma_k \leftarrow$ \eqref{eq:sigma_x}--\eqref{eq:sigma_z};
+    \item $\vect{u}_i \leftarrow$ \eqref{eq:relay};
+    \item $\vect{a}_i \leftarrow$ \eqref{eq:pm_accel};
+    \item $\vect{v}_i, \vect{p}_i \leftarrow$ \eqref{eq:pm_vel}--\eqref{eq:pm_pos}.
+  \end{enumerate}
+\end{enumerate}
+
+\subsection{Webots}
+
+\begin{enumerate}
+  \item \code{robot.step(8 ms)}: физика + сенсоры.
+  \item Если $t > 8$ с: собрать informants, вычислить distances.
+  \item Ройевой блок $\to$ $\delta_{rpy}$ или $a_{des}$.
+  \item PID $\to$ \eqref{eq:mavic_mix} или \eqref{eq:cf_mix}.
+  \item \code{setVelocity} на четырёх моторах.
+\end{enumerate}
+
+%====================================================================
+\section{Сравнение: point-mass, Webots, Gazebo/SITL}
+%====================================================================
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Аспект} & \textbf{Point-mass} & \textbf{Webots (swarm\_mavic)} & \textbf{Gazebo/SITL (Kursov3)} \\
+\hline
+DOF агента & 3 (перев.) & 6 (жёсткое тело) & 6 \\
+Движок & Python & Webots ODE & DART / SITL \\
+Гравитация (3D) & нет & $\approx 9.81$ м/с$^2$ & да \\
+Трение/дrag & только 1D & damping 0.5 & аero + contact \\
+Выход управления & $\vect{u}$ (сила) & $\omega_{\mathrm{motor}}$ & PWM $\to$ тяга \\
+Контакты & нет & пол (не использ.) & LCP + mesh \\
+Якоря & функции/файлы & robot\_0 / virtual & MAVLink / логика \\
+Шаг & 1--20 ms & 8 ms & 1--10 ms \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{Общее.}
+Во всех трёх стеках для ройевой логики используются зазоры $d^\pm$,
+$\xi=\tanh$ и релей по $\sigma$; различается только
+\textbf{исполнительный уровень} (прямая сила vs PID+моторы vs SITL motor model).
+
+%====================================================================
+\section{Сводная таблица обозначений}
+%====================================================================
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Символ} & \textbf{Единица} & \textbf{Смысл} \\
+\hline
+$\vect{p}_i$ & м & положение агента $i$ \\
+$\vect{v}_i$ & м/с & скорость \\
+$m_i$ & кг & масса (обычно 1) \\
+$R_{\mathrm{vis}}$ & м & радиус видимости \\
+$w$ & м & желаемый зазор по $z$ (или $y$ в коридоре) \\
+$u_{\max}$ & Н или м/с$^2$ & насыщение bang-bang \\
+$\Delta t$ & с & шаг интегрирования \\
+$d_k^\pm$ & м & минимальная проекция на $\pm$ ось \\
+$\sigma_k$ & м/с & переменная скольжения \\
+$\xi(g)$ & --- & $\tanh(g)$ \\
+$k_f$ & 1/с & вязкое трение (1D) \\
+$g$ & м/с$^2$ & гравитация (1D cruise) \\
+$\vect{F}^{\mathrm{ext}}$ & Н & ветер (Python) \\
+$\Delta t_{\mathrm{WB}}$ & с & шаг Webots (0.008) \\
+$k_{\mathrm{thrust}}$ & --- & hover Mavic \\
+\hline
+\end{tabular}
+\end{center}
+
+%====================================================================
+\section{Ссылки на исходный код}
+%====================================================================
+
+\begin{itemize}
+  \item Динамика точки: \code{Anatoliy/swarm\_mavic/controllers/swarm\_python/point\_mass.py}
+  \item 3D рой + ветер: \code{.../point\_mass\_acc\_mod.py}
+  \item 1D крейсер: \code{.../cruise.py}
+  \item Mavic Webots: \code{.../swarm\_python/swarm\_python.py}
+  \item Crazyflie PID: \code{.../swarm\_python\_crazyflie/pid\_controller.py}
+  \item Acc-мост: \code{.../crazyflie\_swarm\_acc/crazyflie\_swarm\_acc.py}
+  \item Коридор: \code{Anatoliy/swarm\_mavic/corridor\_sweeping/main.py}
+  \item Сетка: \code{Anatoliy/swarm\_mavic/grid\_antenna/main.py}, \code{utils.py}
+  \item Траектории якорей: \code{.../grid\_antenna/scene\_creator.py}
+  \item Миры Webots: \code{Anatoliy/swarm\_mavic/worlds/*.wbt}
+  \item Webots R2023b: \url{https://cyberbotics.com/doc/guide/index}
+\end{itemize}
+
+%====================================================================
+\section*{Заключение}
+%====================================================================
+
+Проект \textbf{swarm\_mavic} разделяет \emph{алгоритм роевого управления}
+(зазоры, $\sigma$, релей) и \emph{физику исполнения}.
+Офлайн-модель --- материальная точка с явной интеграцией
+\eqref{eq:pm_vel}--\eqref{eq:pm_pos}, без гравитации и столкновений;
+она удобна для быстрых эксперimentов (коридор, сетка антенны, ветер).
+Webots добавляет полную 6-DOF динамику Mavic/Crazyflie с гравитацией,
+демпфированием и каскадным PID; ройевой закон встраивается как
+возмущения или ускорения. Для сопоставления с
+\code{gazebo\_drone\_physics\_model.ru.tex}: в swarm\_mavic нет
+контактной задачи LCP и mesh-коллизий, зато явно задана
+распределённая логика $\sigma$ на уровне каждого агента.
+
+\end{document}
