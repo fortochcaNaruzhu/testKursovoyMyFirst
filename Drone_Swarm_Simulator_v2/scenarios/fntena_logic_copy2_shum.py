@@ -9,8 +9,8 @@
 - по X/Y/Z считаем sigma_b = v_b - tanh(d_b_plus) + tanh(d_b_minus)
 - X/Y удерживаются PID-регулятором в якорной колонне
 - Z управляется bang-bang: u_z = -sign(sigma_z) (маппинг прямо в RC PWM)
-- выбор соседей как в grid_antenna: ближайший по знаку проекции на каждой оси
-  среди видимых по евклидовому радиусу R_vis.
+- X/Y: среди видимых по R_vis — максимальная проекция по знаку на каждой оси;
+  Z: ближайший по проекции (как в grid_antenna).
 
 Логи (CSV) расширены: sigma_x/y/z, PWM стиков, скорости vx/vy/vz (NED).
 """
@@ -236,10 +236,11 @@ def _nearest_distances_by_axis(
     peers: List[Tuple[float, float, float]],
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
-    grid_antenna SceneSupervisor.get_mins_ids behavior:
-    nearest positive projection and nearest negative (absolute) per axis.
-    A peer with ~zero projection is not a neighbor on that axis; otherwise equal-height
-    takeoff makes every drone "already have" a z-neighbor and the vertical law never starts.
+    Per-axis peer projections among visible neighbors.
+
+    X/Y: farthest in each signed direction (max projection).
+    Z: nearest in each signed direction (min projection), as in grid_antenna —
+    a peer with ~zero projection is not a neighbor on that axis.
     """
     x_plus: Optional[float] = None
     y_plus: Optional[float] = None
@@ -249,13 +250,13 @@ def _nearest_distances_by_axis(
     z_minus: Optional[float] = None
     for vx, vy, vz in peers:
         if vx > AXIS_EPS_M:
-            x_plus = float(vx) if x_plus is None else min(x_plus, float(vx))
+            x_plus = float(vx) if x_plus is None else max(x_plus, float(vx))
         elif vx < -AXIS_EPS_M:
-            x_minus = float(-vx) if x_minus is None else min(x_minus, float(-vx))
+            x_minus = float(-vx) if x_minus is None else max(x_minus, float(-vx))
         if vy > AXIS_EPS_M:
-            y_plus = float(vy) if y_plus is None else min(y_plus, float(vy))
+            y_plus = float(vy) if y_plus is None else max(y_plus, float(vy))
         elif vy < -AXIS_EPS_M:
-            y_minus = float(-vy) if y_minus is None else min(y_minus, float(-vy))
+            y_minus = float(-vy) if y_minus is None else max(y_minus, float(-vy))
         if vz > AXIS_EPS_M:
             z_plus = float(vz) if z_plus is None else min(z_plus, float(vz))
         elif vz < -AXIS_EPS_M:

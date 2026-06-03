@@ -263,3 +263,33 @@ mkdir -p "$OUTDIR"
   source /opt/ros/jazzy/setup.bash
 cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
 python3 replay/replay_rviz2.py --experiment /home/user/Kursov3/test_logov/antena_shum_run --rviz
+
+
+
+
+############################################################
+Последняя настройка антены
+просмотр преобразования диапазноа из u в шим сигнал
+замена мин на макс для x,y координат
+
+#####Запуск эксперимента
+cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+source ../drone_env/bin/activate
+
+OUTDIR=/home/user/Kursov3/test_logov/fntena_logic_copy2_maxproj_run
+mkdir -p "$OUTDIR"
+
+python launch_simulation.py -s -c fntena_logic_copy2 -n 4 \
+  --no-sitl-console --no-2d-visualizer \
+  --duration 60 \
+  --experiment-dir "$OUTDIR" \
+  --log-mode mavlink
+
+#####Просмотр: 3D replay в RViz2
+source /opt/ros/jazzy/setup.bash
+cd /home/user/Kursov3/Drone_Swarm_Simulator_v2
+
+python3 replay/replay_rviz2.py \
+  --experiment /home/user/Kursov3/test_logov/fntena_logic_copy2_maxproj_run \
+  --rate 1.0 \
+  --rviz

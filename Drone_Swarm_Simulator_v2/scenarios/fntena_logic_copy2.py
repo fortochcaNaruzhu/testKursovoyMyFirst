@@ -3,7 +3,7 @@
 Вертикальная «антенна» над якорем с законом максимально близким к
 `Anatoliy/swarm_mavic/grid_antenna` (PointAgent.perform / control_force).
 Видимые соседи выбираются по всем осям X/Y/Z как в `grid_antenna`; команды
-по X/Y формируются из соседского sigma как u=clip(-sigma, -1, 1) и линейно
+по X/Y формируются из соседского sigma как u=clip(-sigma, -3, 3) и линейно
 масштабируются в RC PWM, а Z дополнительно проходит через PI-слой для
 согласования с RC/POSHOLD.
 
@@ -11,8 +11,8 @@
 - по X/Y/Z считаем sigma_b = v_b - tanh(d_b_plus) + tanh(d_b_minus)
 - X/Y управляются непрерывным sigma_x/sigma_y из локального соседского закона
 - Z управляется по sigma_z с PI-адаптацией RC PWM
-- выбор соседей как в grid_antenna: ближайший по знаку проекции на каждой оси
-  среди видимых по евклидовому радиусу R_vis.
+- X/Y: среди видимых по R_vis — максимальная проекция по знаку на каждой оси;
+  Z: ближайший по проекции (как в grid_antenna).
 
 Логи (CSV) расширены: sigma_x/y/z, PWM стиков, скорости vx/vy/vz (NED).
 """
@@ -70,6 +70,7 @@ RC_MAX = 1900
 XY_PWM_MAX = 110
 XY_PWM_MIN_STEP = 18
 XY_SIGMA_DEADBAND = 0.04
+XY_UNIT_LIMIT = 1.0
 
 # Z RC bang-bang mapping (PWM delta around 1500).
 # POSHOLD has inertia and delay; pure saturated bang-bang caused a persistent
@@ -199,9 +200,10 @@ def _clamp_rc(pwm: int, lo: int = RC_MIN, hi: int = RC_MAX) -> int:
     return max(lo, min(hi, int(pwm)))
 
 
-def _unit_to_pwm(u: float, *, invert: bool = False) -> int:
-    """Map normalized control u in [-1, 1] to RC PWM in [1100, 1900]."""
-    unit = max(-1.0, min(1.0, float(u)))
+def _unit_to_pwm(u: float, *, invert: bool = False, unit_limit: float = XY_UNIT_LIMIT) -> int:
+    """Map control u in [-unit_limit, unit_limit] to RC PWM in [1100, 1900]."""
+    lim = max(1e-9, float(unit_limit))
+    unit = max(-lim, min(lim, float(u))) / lim
     if invert:
         unit = -unit
     pwm = float(RC_NEUTRAL) + unit * ((float(RC_MAX) - float(RC_MIN)) / 2.0)
@@ -276,10 +278,11 @@ def _nearest_distances_by_axis(
     peers: List[Tuple[float, float, float]],
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
-    grid_antenna SceneSupervisor.get_mins_ids behavior:
-    nearest positive projection and nearest negative (absolute) per axis.
-    A peer with ~zero projection is not a neighbor on that axis; otherwise equal-height
-    takeoff makes every drone "already have" a z-neighbor and the vertical law never starts.
+    Per-axis peer projections among visible neighbors.
+
+    X/Y: farthest in each signed direction (max projection).
+    Z: nearest in each signed direction (min projection), as in grid_antenna —
+    a peer with ~zero projection is not a neighbor on that axis.
     """
     x_plus: Optional[float] = None
     y_plus: Optional[float] = None
@@ -289,13 +292,13 @@ def _nearest_distances_by_axis(
     z_minus: Optional[float] = None
     for vx, vy, vz in peers:
         if vx > AXIS_EPS_M:
-            x_plus = float(vx) if x_plus is None else min(x_plus, float(vx))
+            x_plus = float(vx) if x_plus is None else max(x_plus, float(vx))
         elif vx < -AXIS_EPS_M:
-            x_minus = float(-vx) if x_minus is None else min(x_minus, float(-vx))
+            x_minus = float(-vx) if x_minus is None else max(x_minus, float(-vx))
         if vy > AXIS_EPS_M:
-            y_plus = float(vy) if y_plus is None else min(y_plus, float(vy))
+            y_plus = float(vy) if y_plus is None else max(y_plus, float(vy))
         elif vy < -AXIS_EPS_M:
-            y_minus = float(-vy) if y_minus is None else min(y_minus, float(-vy))
+            y_minus = float(-vy) if y_minus is None else max(y_minus, float(-vy))
         if vz > AXIS_EPS_M:
             z_plus = float(vz) if z_plus is None else min(z_plus, float(vz))
         elif vz < -AXIS_EPS_M:
@@ -367,12 +370,13 @@ def _sigma_from_distances(distances: Tuple[float, float, float, float, float, fl
     return (sigma_x, sigma_y, sigma_z)
 
 
-def _xy_unit_from_sigma(sigma: float) -> float:
-    """Continuous neighbor-sigma control u=clip(-sigma, -1, 1), with deadband."""
+def _xy_unit_from_sigma(sigma: float, *, unit_limit: float = XY_UNIT_LIMIT) -> float:
+    """Continuous neighbor-sigma control u=clip(-sigma, -unit_limit, unit_limit), with deadband."""
     s = float(sigma)
     if abs(s) < float(XY_SIGMA_DEADBAND):
         return 0.0
-    return max(-1.0, min(1.0, -s))
+    lim = float(unit_limit)
+    return max(-lim, min(lim, -s))
 
 
 def _throttle_delta_from_alt_error(alt_error_m: float, pwm_max: int, pwm_min_step: int) -> int:
@@ -583,7 +587,7 @@ def _control_loop(
         sigma_x, sigma_y, sigma_z = _sigma_from_distances(distances, (vx, vy, vz))
 
         # X/Y use normalized controls from neighbor sigma, then
-        # linear RC scaling [-1, 1] -> [1100, 1900].
+        # linear RC scaling [-3, 3] -> [1100, 1900] (|u|=3 is full stick).
         # pitch affects +x, roll affects +y; throttle affects -z (altitude up is -z).
         u_x = _xy_unit_from_sigma(sigma_x)
         u_y = _xy_unit_from_sigma(sigma_y)
@@ -729,7 +733,8 @@ def main() -> None:
             "anchor_id": anchor_id,
             "log_hz": float(args.log_hz),
             "log_mode": str(args.log_mode),
-            "xy_mapping": "unit_to_pwm_1100_1900",
+            "xy_mapping": "unit_to_pwm_1100_1900_limit3",
+            "xy_unit_limit": float(XY_UNIT_LIMIT),
             "rc_min": int(RC_MIN),
             "rc_max": int(RC_MAX),
             "xy_missing_neighbor_distance_m": 0.0,
